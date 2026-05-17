@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 多对话助手</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- 侧边栏：多对话列表 -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <h3>对话列表</h3>
+        <button id="newChatBtn">+ 新建对话</button>
+      </div>
+      <div id="chatList" class="chat-list"></div>
+    </div>
+
+    <!-- 主聊天区域 -->
+    <div class="chat-container">
+      <header class="chat-header">
+        <span>AI 对话助手</span>
+        <button id="clearBtn">清空当前对话</button>
+      </header>
+
+      <div id="messageList" class="message-list"></div>
+
+      <div class="input-area">
+        <input id="userInput" placeholder="输入消息..." autocomplete="off" />
+        <button id="sendBtn">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/script.js"></script>
+</body>
+</html>

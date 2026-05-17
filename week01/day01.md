@@ -1,0 +1,519 @@
+# Week 01 — Python 速成
+
+## 本周目标
+FastAPI + Pydantic v2 + async/await，产出：一个 FastAPI 后端 Demo
+
+---
+
+## Day 01 — 类型语法 + 推导式 + with + 异步
+
+> 对照基础：你熟悉 JS/TS，以下用对照的方式讲 Python。
+> Python 的类型注解**运行时完全不检查**，但 FastAPI 和 Pydantic 会在框架层强制读取和执行。
+
+---
+
+### 一、类型系统对比
+
+#### 1.1 基础类型映射
+
+```typescript
+// TS
+let name: string = "hello";
+let age: number = 30;
+let active: boolean = true;
+let nothing: null = null;
+let undef: undefined = undefined;
+```
+
+```python
+# Python
+name: str = "hello"
+age: int = 30
+active: bool = True          # 注意大写
+nothing: None = None         # Python 只有 None，没有 null/undefined 之分
+```
+
+**关键差异：**
+- `true/false` → `True/False`（首字母大写）
+- `null / undefined` → 统一用 `None`
+- `number` → `int | float`（Python 分整型和浮点）
+
+#### 1.2 容器类型
+
+```typescript
+// TS
+let arr: string[] = ["a", "b"];
+let record: Record<string, number> = { math: 90 };
+let tuple: [number, number] = [1.0, 2.0];
+let set: Set<number> = new Set([1, 2, 3]);
+```
+
+```python
+# Python 3.9+（直接用内置泛型，不需要从 typing 导入）
+arr: list[str] = ["a", "b"]
+record: dict[str, int] = {"math": 90}
+tuple_val: tuple[float, float] = (1.0, 2.0)     # tuple 用 ()
+set_val: set[int] = {1, 2, 3}                    # set 用 {}，空集合必须写 set()
+```
+
+**关键差异：**
+- `[]` → `[]` 一样，但 Python 没有 `Array<T>` 这种写法
+- `{}` → `dict` 用 `{}`，`set` 也用 `{}`（空集合 `set()` 不是 `{}`，`{}` 是空字典）
+- Python 的 `tuple` 不可变，类似 `as const` 的只读数组
+
+#### 1.3 联合类型 & 可选
+
+```typescript
+// TS
+type Status = string | number;
+let maybeName: string | null = null;
+let maybeName2?: string;               // 等价于 string | undefined
+```
+
+```python
+# Python 3.10+
+Status = str | int
+maybe_name: str | None = None          # 推荐写法
+```
+
+**没有 `?` 可选语法**，必须显式写 `| None`。
+
+#### 1.4 接口 → dataclass & TypedDict
+
+```typescript
+// TS：interface 定义对象形状
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+}
+
+// TS：函数返回类型
+interface AgentResult {
+  model: string;
+  usage: { inputTokens: number; outputTokens: number };
+  stopReason: "end_turn" | "tool_use";
+}
+```
+
+```python
+# Python 方案一：dataclass（推荐，功能更强）
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class Message:
+    role: Literal["user", "assistant"]
+    content: str
+
+@dataclass
+class AgentResult:
+    model: str
+    input_tokens: int
+    output_tokens: int
+    stop_reason: Literal["end_turn", "tool_use", "max_tokens"]
+
+# Python 方案二：TypedDict（纯类型标注，运行时就是 dict）
+from typing import TypedDict
+class Message(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str
+```
+
+**什么时候用哪个：**
+- `dataclass` ≈ TS 的 `class` + 自动生成 constructor/equals/toString，用于有行为的对象
+- `TypedDict` ≈ TS 的 `interface`，用于纯数据结构，运行时就是普通 dict
+- 后面学的 `Pydantic BaseModel` 是加强版 dataclass，带运行时校验
+
+#### 1.5 函数签名
+
+```typescript
+// TS
+function process(data: string | number): string {
+  return String(data);
+}
+
+function fetchUser(id: number): Promise<User> { ... }
+
+const handler: (input: string) => void = (input) => { ... };
+```
+
+```python
+# Python
+def process(data: str | int) -> str:
+    return str(data)
+
+async def fetch_user(id: int) -> User:
+    ...
+
+from collections.abc import Callable
+handler: Callable[[str], None] = lambda input: ...
+```
+
+**关键差异：**
+- Python 函数名用 `snake_case`，TS 用 `camelCase`
+- `async def` 和 `async function` 语法不同，但语义几乎一样
+- `Callable[[入参类型], 返回类型]`，注意入参是列表
+
+#### 1.6 字面量类型（Agent 工具参数必备）
+
+```typescript
+// TS
+type Role = "user" | "assistant" | "system";
+type StopReason = "end_turn" | "tool_use" | "max_tokens";
+```
+
+```python
+# Python
+from typing import Literal
+Role = Literal["user", "assistant", "system"]
+StopReason = Literal["end_turn", "tool_use", "max_tokens"]
+```
+
+**几乎一样**，但 Python 的 `Literal` 需要从 `typing` 导入。
+
+---
+
+### 二、推导式 → JS 的 map/filter
+
+```typescript
+// TS：链式调用 map + filter
+const squares = [1, 2, 3, 4, 5].map(x => x ** 2);
+// → [1, 4, 9, 16, 25]
+
+const evens = [1, 2, 3, 4, 5].filter(x => x % 2 === 0);
+// → [2, 4]
+
+const labels = [1, 2, 3].map(x => x % 2 === 0 ? "even" : "odd");
+// → ["odd", "even", "odd"]
+```
+
+```python
+# Python：推导式，一个括号搞定
+squares = [x**2 for x in range(1, 6)]                     # [1, 4, 9, 16, 25]
+evens = [x for x in range(1, 6) if x % 2 == 0]           # [2, 4]
+labels = ["even" if x % 2 == 0 else "odd" for x in range(1, 4)]  # ["odd", "even", "odd"]
+```
+
+**思维转换：** TS 是链式 `.map().filter()`，Python 全部写在一个 `[]` 里，`for` 在前条件在后。
+
+```python
+# 字典推导（TS 没有直接对照，类似 Object.fromEntries）
+word_len = {word: len(word) for word in ["hello", "world"]}
+# → {"hello": 5, "world": 5}
+
+# 集合推导
+unique_lengths = {len(w) for w in ["a", "bb", "ccc", "bb"]}
+# → {1, 2, 3}
+
+# 生成器表达式（惰性求值，省内存）
+sum(x**2 for x in range(1_000_000))   # 不会先创建一百万元素的列表
+```
+
+**AI Agent 场景 —— 从 API 响应提取 tool_use：**
+
+```python
+response_blocks = [
+    {"type": "text", "text": "Hello"},
+    {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {"query": "weather"}},
+    {"type": "thinking", "thinking": "hmm..."},
+    {"type": "tool_use", "id": "toolu_2", "name": "calc", "input": {"expr": "2+2"}},
+]
+
+# 一行提取所有工具调用名
+tool_names = [b["name"] for b in response_blocks if b.get("type") == "tool_use"]
+# → ["search", "calc"]
+
+# 一行构建 {id: (name, input)} 映射
+tool_map = {
+    b["id"]: (b["name"], b["input"])
+    for b in response_blocks
+    if b.get("type") == "tool_use"
+}
+# → {"toolu_1": ("search", {"query": "weather"}), "toolu_2": ("calc", {"expr": "2+2"})}
+```
+
+```typescript
+// 对照 TS 写法
+const toolNames = responseBlocks
+  .filter(b => b.type === "tool_use")
+  .map(b => b.name);
+```
+
+---
+
+### 三、with 语句 → 没有直接对照
+
+JS/TS 没有 `with` 的直接等价物。最接近的是：
+
+```typescript
+// TS：try/finally 手动管理
+const f = await fs.open("data.txt", "r");
+try {
+  const data = await f.readFile();
+  // ...
+} finally {
+  await f.close();  // 必须手动
+}
+
+// TS：using（ES2024 提案，不一定能用）
+using f = await fs.open("data.txt", "r");
+```
+
+```python
+# Python：with 自动管理，离开缩进就自动清理
+with open("data.txt") as f:
+    data = f.read()
+# 出了 with 块，文件自动关闭（即使中间抛异常）
+```
+
+**常见用法：**
+
+```python
+# 文件操作
+with open("input.txt") as f_in, open("output.txt", "w") as f_out:
+    f_out.write(f_in.read().upper())
+
+# HTTP 客户端
+import httpx
+async with httpx.AsyncClient(timeout=30) as client:
+    resp = await client.get("https://api.example.com")
+
+# 锁（对比 TS 用 Mutex / synchronized）
+import threading
+lock = threading.Lock()
+with lock:
+    shared_data["count"] += 1                # 自动加锁/解锁
+
+# 临时修改（离开 with 自动恢复）
+from contextlib import chdir
+with chdir("/tmp"):                          # 临时切目录
+    print(os.getcwd())                       # /tmp
+print(os.getcwd())                           # 自动恢复
+```
+
+**自己写一个（AI Agent 最常用）：**
+
+```python
+from contextlib import contextmanager
+from collections.abc import Generator
+import time
+
+# 方式一：类（复杂场景）
+class Timer:
+    def __enter__(self):
+        self.start = time.time()
+        return self
+    def __exit__(self, *args):
+        print(f"耗时: {time.time() - self.start:.2f}s")
+
+# 方式二：contextmanager 装饰器（简单场景，推荐）
+@contextmanager
+def agent_turn(name: str) -> Generator[None, None, None]:
+    """Agent 调试辅助：标记每轮开始/结束"""
+    print(f"[{name}] 开始...")
+    try:
+        yield                                  # yield 这里交出控制权
+    finally:
+        print(f"[{name}] 结束")
+
+with agent_turn("路线规划"):
+    # ... Agent 逻辑
+    pass
+```
+
+---
+
+### 四、解包 & 合并 → Spread
+
+```typescript
+// TS：spread
+const merged = { ...defaults, ...overrides };  // 后面的覆盖前面的
+const copy = [...arr];
+const [first, ...rest] = arr;
+```
+
+```python
+# Python：解包（两种场景）
+# 字典合并
+merged = {**defaults, **overrides}             # TS: { ...defaults, ...overrides }
+
+# 列表/元组解包
+first, *rest = [1, 2, 3, 4]                  # TS: const [first, ...rest] = arr
+
+# 函数参数解包
+def create_message(model: str, max_tokens: int, **kwargs): ...
+config = {"model": "claude-opus-4-7", "max_tokens": 4096, "stream": True}
+create_message(**config)                       # 自动展开为关键字参数
+```
+
+---
+
+### 五、f-string → Template Literal
+
+```typescript
+// TS
+const msg = `Model: ${name} ${version}`;
+const price = `$${(5.0).toFixed(2)}`;
+```
+
+```python
+# Python
+msg = f"Model: {name} {version}"
+price = f"${5.0:.2f}"                          # :.2f = toFixed(2)
+
+# 调试模式（Python 3.8+，打印变量名=值）
+print(f"{cache_hits=} {cache_misses=}")        # cache_hits=150 cache_misses=20
+```
+
+---
+
+### 六、async/await —— 几乎一样但有几处不同
+
+```typescript
+// TS
+async function fetchData(): Promise<User> {
+  const resp = await fetch("/api/user");
+  return await resp.json();
+}
+const user = await fetchData();
+```
+
+```python
+# Python
+import httpx
+
+async def fetch_data() -> User:
+    async with httpx.AsyncClient() as client:      # async with 异步上下文管理器
+        resp = await client.get("/api/user")
+        return resp.json()
+
+user = await fetch_data()
+```
+
+**关键差异：**
+- `function` → `def`，`() =>` → `lambda`
+- Python 需要 `asyncio.run(main())` 才能跑顶层 await（不像 TS 随便 await）
+- Python 有 `async with` 和 `async for`，TS 没有
+- Python 的 async 需要一个事件循环（FastAPI 帮你管了，不用操心）
+
+```python
+# Python 入口必须这样写（FastAPI 自动处理，你写脚本时才需要）
+import asyncio
+
+async def main():
+    result = await fetch_data()
+    print(result)
+
+if __name__ == "__main__":
+    asyncio.run(main())          # TS 不需要这一步
+```
+
+---
+
+### 今日练习（约 2 小时）
+
+| # | 练习 | 时间 |
+|---|------|------|
+| 1 | 用 `dataclass` 定义 `AgentResult`（model / tokens / content / stop_reason） | 15 min |
+| 2 | 用推导式从 API 响应提取所有 tool_use block → `{id: (name, input)}` | 15 min |
+| 3 | 用 `@contextmanager` 写一个 `CostTracker`，追踪 LLM 调用的耗时和 token 成本 | 20 min |
+| 4 | 综合：模拟一次 Agent 调用的完整数据流 | 40 min |
+
+#### 综合练习框架
+
+```python
+"""模拟一次 Claude API Agent 调用的完整数据流"""
+from dataclasses import dataclass
+from contextlib import contextmanager
+from collections.abc import Generator
+from typing import Literal
+import time
+
+# === 1. dataclass 定义数据结构 ===
+@dataclass
+class Usage:
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+
+@dataclass
+class AgentResult:
+    model: str
+    content: list[dict]
+    usage: Usage
+    stop_reason: Literal["end_turn", "tool_use", "max_tokens", "refusal"]
+    elapsed_ms: float = 0
+
+# === 2. 上下文管理器 ===
+@contextmanager
+def cost_tracker(model: str) -> Generator[dict, None, None]:
+    """追踪单次 LLM 调用的耗时和成本"""
+    start = time.time()
+    stats = {"model": model, "start": start}
+    try:
+        yield stats
+    finally:
+        stats["elapsed_ms"] = (time.time() - start) * 1000
+        print(f"[{model}] {stats['elapsed_ms']:.0f}ms")
+
+
+# === 3. 提取 tool_use ===
+def extract_tool_calls(content: list[dict]) -> dict[str, tuple[str, dict]]:
+    """从 API 响应提取所有 tool_use 块
+    返回 {tool_use_id: (tool_name, input)}
+    """
+    # TODO: 用推导式实现
+    pass
+
+
+# === 4. 模拟完整流程 ===
+def simulate_agent_call(query: str) -> AgentResult:
+    mock_response = {
+        "model": "claude-opus-4-7",
+        "content": [
+            {"type": "text", "text": "让我查一下天气"},
+            {"type": "tool_use", "id": "toolu_001", "name": "get_weather", "input": {"city": "北京"}},
+            {"type": "text", "text": "还需要查时间"},
+            {"type": "tool_use", "id": "toolu_002", "name": "get_time", "input": {}},
+        ],
+        "usage": {"input_tokens": 150, "output_tokens": 80},
+        "stop_reason": "tool_use",
+    }
+
+    with cost_tracker(mock_response["model"]) as stats:
+        # 模拟网络延迟
+        time.sleep(0.1)
+
+        tools = extract_tool_calls(mock_response["content"])
+        print(f"工具调用: {tools}")
+
+    return AgentResult(
+        model=mock_response["model"],
+        content=mock_response["content"],
+        usage=Usage(**mock_response["usage"]),
+        stop_reason="tool_use",
+        elapsed_ms=stats["elapsed_ms"],
+    )
+
+
+if __name__ == "__main__":
+    result = simulate_agent_call("北京今天天气怎么样？")
+    print(f"模型: {result.model}")
+    print(f"耗时: {result.elapsed_ms:.0f}ms")
+    print(f"Token: {result.usage.input_tokens} in / {result.usage.output_tokens} out")
+    print(f"原因: {result.stop_reason}")
+```
+
+---
+
+### Day 01 检查清单
+
+- [ ] 能用 `dataclass` 定义数据结构（替代 TS interface）
+- [ ] 能用 `str | None` 替代 `?: string`
+- [ ] 能用 `Literal["a", "b"]` 替代 `type X = "a" | "b"`
+- [ ] 能用推导式替代 `.map().filter()` 链式调用
+- [ ] 能用 `with` 管理资源（替代 try/finally）
+- [ ] 能用 `@contextmanager` 写自己的上下文管理器
+- [ ] 能用 `{**a, **b}` 合并字典（替代 `{...a, ...b}`）
+- [ ] 能用 f-string 替代模板字符串 `` ` ` ``
+- [ ] 知道 `async def` 和 `await` 的写法，知道需要 `asyncio.run()`
