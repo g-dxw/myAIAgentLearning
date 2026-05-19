@@ -1,0 +1,1 @@
+- [Architecture v1](architecture-v1.md) — Complete Phase 1 architecture design based on PRD v1

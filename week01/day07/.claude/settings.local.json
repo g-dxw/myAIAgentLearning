@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(alembic init *)",
+      "Bash(timeout 10 python -c \"from main import app; print\\('OK: FastAPI app loaded successfully'\\)\")",
+      "Bash(uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s http://localhost:8000/api/health)",
+      "Bash(timeout 8 python -c \"from main import app; print\\('OK'\\)\")",
+      "Bash(uvicorn main:app --host 0.0.0.0 --port 8000)",
+      "Bash(taskkill /F /PID 6136)",
+      "Bash(powershell -Command \"Stop-Process -Id 6136 -Force\")",
+      "Bash(netstat -ano)",
+      "Bash(curl -s -X POST http://localhost:8000/api/auth/login -H \"Content-Type: application/json\" -d '{\"username\":\"admin\",\"password\":\"fd7105203322\"}')",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(npx vite *)",
+      "Bash(curl -s http://localhost:5173)"
+    ]
+  }
+}
