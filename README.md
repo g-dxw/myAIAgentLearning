@@ -12,7 +12,7 @@
 |------|------|-------------------|---------------------|------|
 | 一 | Week 01 | Python 速成 + FastAPI | Claude Code 入门：CLAUDE.md、结对编程 | 🟡 |
 | 一 | Week 02 | LLM 原理 | 用 Claude Code 调试 API、对比模型输出 | ⬜ |
-| 一 | Week 03 | Tool Use + 结构化输出 | 拆解 Claude Code 的 tool call 循环 | ⬜ |
+| 一 | Week 03 | Agent 核心循环：Function Calling + Tool Use（手写 Agent Loop） | 对比 Claude Code 的 tool call 设计 | 🟡 |
 | 二 | Week 04 | RAG 原理与实践 | Claude Code 自定义 Slash Commands + Hooks | ⬜ |
 | 二 | Week 05 | 向量数据库 | 用 Claude Code 管理个人知识库（CLAUDE.md 进阶） | ⬜ |
 | 二 | Week 06 | LangChain + LangGraph | Claude Code 辅助调试 Agent 状态机 | ⬜ |
