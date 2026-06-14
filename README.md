@@ -10,10 +10,10 @@
 
 | 阶段 | 周次 | 主线：Agent 技术栈 | 副线：CLI Agent 工具 | 状态 |
 |------|------|-------------------|---------------------|------|
-| 一 | Week 01 | Python 速成 + FastAPI | Claude Code 入门：CLAUDE.md、结对编程 | 🟡 |
-| 一 | Week 02 | LLM 原理 | 用 Claude Code 调试 API、对比模型输出 | ⬜ |
-| 一 | Week 03 | Agent 核心循环：Function Calling + Tool Use（手写 Agent Loop） | 对比 Claude Code 的 tool call 设计 | 🟡 |
-| 二 | Week 04 | RAG 原理与实践 | Claude Code 自定义 Slash Commands + Hooks | ⬜ |
+| 一 | Week 01 | Python 速成 + FastAPI | Claude Code 入门：CLAUDE.md、结对编程 | ✅ |
+| 一 | Week 02 | LLM 原理 | 用 Claude Code 调试 API、对比模型输出 | ✅ |
+| 一 | Week 03 | Agent 核心循环：Function Calling + Tool Use（手写 Agent Loop） | 对比 Claude Code 的 tool call 设计 | ✅ |
+| 二 | Week 04 | RAG 原理与实践 | Claude Code 自定义 Slash Commands + Hooks | 🟡 |
 | 二 | Week 05 | 向量数据库 | 用 Claude Code 管理个人知识库（CLAUDE.md 进阶） | ⬜ |
 | 二 | Week 06 | LangChain + LangGraph | Claude Code 辅助调试 Agent 状态机 | ⬜ |
 | 三 | Week 07 | 多 Agent 协作 | 工具对比：Claude Code vs Cursor vs Aider | ⬜ |
@@ -24,6 +24,8 @@
 | 四 | Week 12 | 综合实战 + 持续迭代 | Claude Code 工作流定型：你的专属开发范式 | ⬜ |
 
 ⬜ 未开始　🟡 进行中　✅ 已完成
+
+> **📍 当前：Week 04（阶段二开局）** — 阶段一（Week 01-03）已收官：Python/FastAPI/LLM/Agent Loop 全部打通。
 
 ### 副线设计思路
 
@@ -47,10 +49,37 @@ Week 10-12：内化     → 形成你自己的 Agent 辅助开发范式，效率
 | Day 01 | 类型语法 + 推导式 + with + async | TS/JS 对照 Python、dataclass、推导式、上下文管理器 | — | ✅ |
 | Day 02 | Pydantic v2 数据校验 | BaseModel、Field、field_validator、model_validator、model_json_schema | — | ✅ |
 | Day 03 | FastAPI 路由 + 请求参数校验 | Path/Query/Body、APIRouter、response_model、HTTPException | — | ✅ |
-| Day 04 | 依赖注入 + 错误处理 | Depends、全局异常处理、中间件、CORS | — | 🟡 |
-| Day 05 | async/await + 异步数据库 | 事件循环、协程 vs 线程、SQLAlchemy async、Depends(get_db) | 用 Claude Code 审查异步代码 | ⬜ |
-| Day 06 | API 设计 + 流式响应 + 文件上传 | RESTful 规范、SSE StreamingResponse、UploadFile | 给项目写 CLAUDE.md | ⬜ |
-| Day 07 | 综合实战：Agent 对话管理平台 | 完整 FastAPI 后端（CRUD + 异步 DB + SSE + 文件上传） | 全程 Claude Code 结对编程 | ⬜ |
+| Day 04 | 依赖注入 + 错误处理 | Depends、全局异常处理、中间件、CORS | — | ✅ |
+| Day 05 | async/await + 异步数据库 | 事件循环、协程 vs 线程、SQLAlchemy async、Depends(get_db) | 用 Claude Code 审查异步代码 | ✅ |
+| Day 06 | API 设计 + 流式响应 + 文件上传 | RESTful 规范、SSE StreamingResponse、UploadFile | 给项目写 CLAUDE.md | ✅ |
+| Day 07 | 综合实战：Agent 对话管理平台 | 完整 FastAPI 后端（CRUD + 异步 DB + SSE + 文件上传） | 全程 Claude Code 结对编程 | ✅ |
+
+---
+
+## Week 02 详细进度
+
+| 天 | 主题 | 主线内容 | 副线（Claude Code） | 状态 |
+|----|------|---------|---------------------|------|
+| Day 01 | Token 机制 + Context Window | Token 是什么、Tokenizer 验证、上下文窗口限制 | 观察 Claude Code 的 token 管理 | ✅ |
+| Day 02 | Token 计量 + API 计费 | tiktoken、token 计数实战、各模型价格对比 | 用 Claude Code 分析 API 调用日志 | ✅ |
+| Day 03 | Thinking / Effort 机制 | extended thinking、reasoning_effort 参数、思维链 | 对比 Claude Code 的 thinking 输出 | ✅ |
+| Day 04 | Streaming 原理 | SSE 协议细节、逐 token 解析、流式 vs 非流式 | Claude Code 的流式输出观察 | ✅ |
+| Day 05 | Prompt Caching | cache_control 标记、缓存命中率、成本优化 | 分析 Claude Code 的缓存策略 | ✅ |
+| Day 06 | Caching 实战 + 错误重试 | 缓存命中率测试、retry 机制、指数退避 | 给对话 API 加错误重试 | ✅ |
+| Day 07 | 产出：对话 API 封装 | 完整 API 客户端（流式+缓存+重试+Token 统计） | 全程 Claude Code 结对编程 | ✅ |
+
+---
+
+## Week 03 详细进度
+
+| 天 | 主题 | 主线内容 | 副线（Claude Code） | 状态 |
+|----|------|---------|---------------------|------|
+| Day 01 | API 实战调用 | LLM API 四角色、httpx 调 API、流式解析、Token 提取 | 对比 Claude Code 的 API 格式 | ✅ |
+| Day 02 | Function Calling 完整流程 | Tool Schema、tool_calls 解析、Handler 分发、结果回传 | 观察 Claude Code 的 tool call 日志 | ✅ |
+| Day 03 | Agent Loop 框架 | while True 循环、ToolAgent 类、max_turns 控制 | Claude Code 的 Agent Loop 深度分析 | ✅ |
+| Day 04 | 结构化输出 | JSON Mode、Pydantic 反序列化、四种方式对比 | Claude Code 的 Structured Output 使用 | ✅ |
+| Day 05 | Tool 设计原则 | 六原则、搜索工具实战、粒度决策、安全性 | Claude Code 工具设计风格分析 | ✅ |
+| Day 06-07 | 产出：完整 Agent | 5+ 工具、验证脚本、Agent 总结 | 全程 Claude Code 结对编程 | ✅ |
 
 ---
 
@@ -87,9 +116,9 @@ Week 10-12：内化     → 形成你自己的 Agent 辅助开发范式，效率
 
 每阶段结束时应有的产出：
 
-- [ ] Week 01：Agent 对话管理平台（多 Agent + 流式对话 + 异步 DB + 文件上传）
-- [ ] Week 02：一个对话 API 封装（流式输出 + 缓存 + 错误重试）
-- [ ] Week 03：一个带工具调用的 Agent（查天气/算数/搜索）
+- [x] Week 01：Agent 对话管理平台（多 Agent + 流式对话 + 异步 DB + 文件上传）
+- [x] Week 02：一个对话 API 封装（流式输出 + 缓存 + 错误重试）
+- [x] Week 03：一个带工具调用的 Agent（查天气/算数/搜索）
 - [ ] Week 04：一个文档问答系统（上传 PDF → 问答）
 - [ ] Week 05：一个路线知识库（语义搜索）
 - [ ] Week 06：一个多步推理 Agent（路线推荐 → 天气 → 装备清单）
@@ -106,16 +135,18 @@ Week 10-12：内化     → 形成你自己的 Agent 辅助开发范式，效率
 ```
 AI-Agent-打卡/
 ├── README.md              ← 你在这里
-├── week01/                ✅ 已拆分为每日文件
-│   ├── day01.md           ✅ Python 类型语法对照
-│   ├── day02.md           ✅ Pydantic v2
-│   ├── day03.md           ✅ FastAPI 路由
-│   ├── day04.md           ✅ Depends + 异常处理
-│   ├── day05.md           ✅ async/await + 异步 DB + 副线
-│   ├── day06.md           ✅ SSE + 文件上传 + 副线
-│   ├── day07.md           ✅ 综合实战 + 全程 Claude Code
-│   └── day01/             Day 01 练习代码
-├── week02/ ~ week12/      ⬜ 待拆分
+├── week01/                ✅ 已完成 — FastAPI + Pydantic + 异步 DB
+│   ├── day01.md ~ day07.md
+│   └── day01/ ~ day07/    每日练习代码
+├── week02/                ✅ 已完成 — LLM 原理 + API 客户端封装
+│   └── day01.md ~ day07.md
+├── week03/                ✅ 已完成 — Agent 核心循环 + Function Calling
+│   ├── day01.md ~ day06-07.md
+│   └── day01/ ~ day07/    每日练习代码
+├── week04/                🟡 进行中 — RAG 原理与实践
+│   ├── day01-07.md        本周总览
+│   └── day01.md ~ day07.md
+├── week05/ ~ week12/      ⬜ 待生成
 ├── .obsidian/             Obsidian 配置（显示思维导图）
-└── AI-Agent-学习计划.md   原始 12 周学习计划（参考）
+└── .git/                  版本控制
 ```
