@@ -1,0 +1,495 @@
+{
+  "config": {
+    "chunk_size": 4000,
+    "chunk_overlap": 300,
+    "retrieval_top_k": 30,
+    "llm_temperature": 0.1,
+    "llm_model": "mimo-v2.5",
+    "embed_model": "nomic-embed-text:latest"
+  },
+  "summary": {
+    "total": 31,
+    "passed": 20,
+    "failed": 11,
+    "accuracy": 64.5,
+    "avg_score": 70.2,
+    "avg_time": 10.9
+  },
+  "results": [
+    {
+      "question": "Python 有哪些基本数据类型？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的文档内容，Python 的基本数据类型如下：\n\n1.  **int (整数)**：Python 3 中整数没有大小限制。例如：`42`, `-7`, `0`。\n2.  **float (浮点数)**：双精度浮点数。例如：`3.14`, `-0.001`, `2.0e3`。\n3.  **str (字符串)**：Unicode 字符串，不可变类型。例如：`\"hello\"`, `'Python",
+      "elapsed": 9.97,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "int",
+        "float",
+        "str",
+        "bool",
+        "NoneType"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 的 list 和 tuple 有什么区别？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的参考文档，Python 的 `list` 和 `tuple` 的区别主要体现在它们的**可变性**和**定义语法**上。以下是具体的对比说明：\n\n### 核心区别\n1.  **可变性（Mutability）**：\n    *   **list（列表）**：是一个**有序可变序列**。这意味着创建后，你可以添加、删除或修改其中的元素。\n    *   **tuple（元组）**：是一个**",
+      "elapsed": 13.22,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "list",
+        "tuple",
+        "可变",
+        "不可变"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 中 *args 和 **kwargs 分别是什么？",
+      "source": "test_python_basics.md",
+      "answer": "根据参考文档片段[1]和[2]，在Python中：\n\n1.  **`*args`** 用于接收任意数量的位置参数。在函数定义时，`*args`会将接收到的所有额外位置参数收集到一个**元组**中。\n2.  **`**kwargs`** 用于接收任意数量的关键字参数。在函数定义时，`**kwargs`会将接收到的所有额外关键字参数收集到一个**字典**中。\n\n文档中给出了一个示例函数 `summar",
+      "elapsed": 9.67,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "*args",
+        "**kwargs",
+        "位置参数",
+        "关键字参数"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 怎么定义一个带默认参数的函数？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的参考文档，关于 Python 函数定义的信息如下：\n\nPython 使用 `def` 关键字定义函数。函数是一等公民，可以作为参数传递，也可以作为返回值。",
+      "elapsed": 9.7,
+      "source_count": 30,
+      "passed": false,
+      "reason": "关键词匹配率低",
+      "matched_keywords": [
+        "def"
+      ],
+      "score": 20,
+      "keyword_ratio": 0.33
+    },
+    {
+      "question": "Python 面向对象编程中 __init__ 方法的作用是什么？",
+      "source": "test_python_basics.md",
+      "answer": "根据参考文档内容，`__init__` 方法在 Python 面向对象编程中的作用是 **作为类的构造函数**，用于在创建类的新实例（对象）时 **初始化该对象的状态**。具体来说：\n\n1.  **定义与角色**：\n    *   文档片段 [1] 明确指出：`__init__` 是一种特殊方法（魔术方法），被定义为 **“构造函数”**。\n    *   它在对象被创建（实例化）时自动调用。\n\n",
+      "elapsed": 11.1,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "__init__",
+        "构造函数",
+        "初始化"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 的类方法装饰器 @classmethod 和 @staticmethod 有什么区别？",
+      "source": "test_python_basics.md",
+      "answer": "",
+      "elapsed": 0,
+      "source_count": 0,
+      "passed": false,
+      "reason": "'keyword_ratio'",
+      "matched_keywords": [],
+      "score": 0,
+      "keyword_ratio": 0
+    },
+    {
+      "question": "Python 中如何读写文件？推荐用什么语句？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的参考文档，Python 中读写文件的操作如下：\n\n### 推荐使用的语句\nPython 使用 `open()` 内置函数进行文件操作，**推荐使用 `with` 语句**来自动管理资源，确保文件正确关闭，避免资源泄漏。参考文档片段 [8] 明确指出：“Python 使用 `open()` 内置函数进行文件操作，推荐使用 `with` 语句自动管理资源。”\n\n### 读取文件的具体步骤和代",
+      "elapsed": 15.12,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "open",
+        "with"
+      ],
+      "score": 86,
+      "keyword_ratio": 0.67
+    },
+    {
+      "question": "Python 处理 JSON 数据用什么模块？",
+      "source": "test_python_basics.md",
+      "answer": "Python 处理 JSON 数据使用的是标准库中的 **`json` 模块**。\n\n根据参考文档，可以通过以下方式使用该模块：\n\n1.  **导入模块**：在代码中需要导入 `json` 模块。\n    ```python\n    import json\n    ```\n    （参考片段 [1]）\n\n2.  **写入（序列化）JSON 数据**：使用 `json.dump()` 函数将 Pyt",
+      "elapsed": 11.13,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "json",
+        "json.dump",
+        "json.load"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 中 try-except-finally 分别什么时候执行？",
+      "source": "test_python_basics.md",
+      "answer": "根据参考文档，在 Python 的异常处理机制中，`try-except-finally` 语句块的各部分执行时机如下：\n\n1.  **`try` 块**：首先且总是被执行的。它包裹着可能会引发异常的代码。\n    *   参考文档片段 [2] 展示了 `try` 块是首先执行的代码段：\n        ```python\n        try:\n            result = 10 ",
+      "elapsed": 11.17,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "try",
+        "except",
+        "finally",
+        "异常"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "Python 如何创建和使用虚拟环境？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的参考文档，关于 Python 虚拟环境的信息如下：\n\n**作用与目的**：\nPython 虚拟环境主要用于**隔离项目的依赖**，以避免不同项目之间的包（库）版本发生冲突。\n\n**详细操作步骤说明**：\n您提供的文档片段中**仅提及了虚拟环境的目的和概念，并未包含创建和使用虚拟环境的具体命令或代码示例**。因此，基于“必须严格基于文档内容回答且不能编造”的原则，我无法提供如 `venv`",
+      "elapsed": 8.44,
+      "source_count": 30,
+      "passed": false,
+      "reason": "回答表示不知道，检索可能失败",
+      "matched_keywords": [
+        "venv"
+      ],
+      "score": 10,
+      "keyword_ratio": 0.25
+    },
+    {
+      "question": "Python Lambda 表达式怎么写？",
+      "source": "test_python_basics.md",
+      "answer": "根据提供的文档，Python 的 Lambda 表达式是**匿名函数的简写方式**。它的基本语法和使用方法如下：\n\n### 1. 语法结构\nLambda 表达式可以定义简单的、一次性使用的函数，其通用语法为：\n`lambda 参数列表 : 表达式`\n- **参数列表**：与普通函数相同，可以有多个参数，用逗号分隔。\n- **表达式**：一个单独的表达式，其计算结果即为函数的返回值。**不能包含复杂",
+      "elapsed": 11.2,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "lambda",
+        "匿名函数"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 是基于哪两个核心库构建的？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档内容，FastAPI 基于以下两个核心库构建：\n\n1. **Starlette**：用于 Web 部分，提供异步支持和路由功能。\n2. **Pydantic**：用于数据部分，提供数据验证和序列化。\n\n此信息直接源自文档片段 [10]，其中明确指出：“FastAPI 基于两个核心库构建：- **Starlette**：用于 Web 部分，提供异步支持和路由功能 - **Pydan",
+      "elapsed": 10.95,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "Starlette",
+        "Pydantic"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 怎么启动开发服务器？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "基于提供的参考文档内容，**文档中没有包含关于“如何启动 FastAPI 开发服务器”的具体信息或步骤。**\n\n文档片段主要涵盖了以下方面：\n*   **应用创建**：例如，片段[30]展示了创建第一个应用的基本代码结构。\n    ```python\n    from fastapi import FastAPI\n    # ... 后续的路由定义 ...\n    app = FastAPI()\n",
+      "elapsed": 9.99,
+      "source_count": 30,
+      "passed": false,
+      "reason": "关键词匹配率低",
+      "matched_keywords": [],
+      "score": 0,
+      "keyword_ratio": 0.0
+    },
+    {
+      "question": "FastAPI 支持哪些 HTTP 请求方法？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档，FastAPI 支持所有 HTTP 请求方法。具体支持的方法列表如下：\n\n*   GET\n*   POST\n*   PUT\n*   DELETE\n*   PATCH\n*   HEAD\n*   OPTIONS\n*   TRACE\n\n这一信息来源于文档片段[3]，其中明确指出：“FastAPI 支持所有 HTTP 请求方法：GET、POST、PUT、DELETE、PATCH、HEA",
+      "elapsed": 8.51,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 中如何用 Pydantic 定义请求体模型？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档，FastAPI 中使用 Pydantic 来定义请求体模型。Pydantic 是 FastAPI 的核心库之一，专门用于数据部分，提供数据验证和序列化功能。具体来说，Pydantic 会自动进行以下数据验证：\n\n- 类型检查\n- 必填检查\n- 范围验证\n- 嵌套模型支持\n\n这些验证功能确保请求体模型在接收数据时自动执行验证，无需额外代码。",
+      "elapsed": 22.82,
+      "source_count": 30,
+      "passed": false,
+      "reason": "关键词匹配率低",
+      "matched_keywords": [
+        "pydantic"
+      ],
+      "score": 20,
+      "keyword_ratio": 0.33
+    },
+    {
+      "question": "FastAPI 的依赖注入用什么装饰器？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档内容，FastAPI 的依赖注入是通过 `Depends` 函数实现的，而不是通过一个专门的装饰器。\n\n具体依据如下：\n- 在片段 **[14]** 中明确指出：“FastAPI 的依赖注入系统是其核心特性之一，**使用 `Depends` 函数实现**。”\n\n文档中并未提及用于依赖注入的特定装饰器。因此，FastAPI 依赖注入的核心工具是 `Depends` 函数。",
+      "elapsed": 8.04,
+      "source_count": 30,
+      "passed": false,
+      "reason": "回答含否定表述但关键词存在，可能检索正确但生成失败",
+      "matched_keywords": [
+        "Depends",
+        "依赖注入"
+      ],
+      "score": 50,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 如何配置 CORS 中间件？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据参考文档内容，配置 FastAPI 的 CORS（跨域资源共享）中间件，核心是使用 **`CORSMiddleware`**。\n\n具体步骤和关键代码示例如下：\n\n1.  **导入**：首先，从 FastAPI 的中间件模块中导入 `CORSMiddleware`。\n    ```python\n    from fastapi.middleware.cors import CORSMiddlew",
+      "elapsed": 14.93,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "CORSMiddleware",
+        "allow_origins",
+        "跨域"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 异步路由处理函数用什么关键字定义？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据参考文档内容，FastAPI 中异步路由处理函数使用 **`async def`** 关键字定义。\n\n具体说明如下：\n*   **`async def`**：这是定义异步路由处理函数的关键字。\n*   **行为**：使用 `async def` 定义的路由处理函数会在线程池中运行。\n\n> **引用来源**：参考文档片段[25]明确指出：“FastAPI 原生支持异步编程。使用 `async d",
+      "elapsed": 7.18,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "async def",
+        "异步"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "FastAPI 怎么实现 SSE 流式响应？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档内容，FastAPI 支持 Server-Sent Events (SSE) 流式响应。\n\n这一信息在以下文档片段中得到明确说明：\n- `[1] ## 九、SSE 流式响应` 中写道：“**FastAPI 支持 Server-Sent Events (SSE) 流式响应：**”\n- `[2] 九、SSE 流式响应` 中写道：“**FastAPI 支持 Server-Sent Ev",
+      "elapsed": 9.7,
+      "source_count": 30,
+      "passed": false,
+      "reason": "关键词匹配率低",
+      "matched_keywords": [
+        "SSE"
+      ],
+      "score": 20,
+      "keyword_ratio": 0.33
+    },
+    {
+      "question": "FastAPI 自动生成的 API 文档怎么访问？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据提供的参考文档，关于 FastAPI 自动生成的 API 文档，相关信息如下：\n\n1.  **文档生成与访问**：FastAPI 会自动生成交互式 API 文档，无需额外配置。这意味着在应用启动后，文档会自动可用，用户无需手动编写或配置文档生成逻辑。\n2.  **文档内容定制**：您可以通过向 `FastAPI()` 实例传递参数来自定义文档信息，例如设置 API 标题、描述、版本、联系方式、",
+      "elapsed": 12.18,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "/docs",
+        "/redoc"
+      ],
+      "score": 86,
+      "keyword_ratio": 0.67
+    },
+    {
+      "question": "FastAPI 中如何定义路径参数和查询参数？",
+      "source": "test_fastapi_guide.txt",
+      "answer": "根据您提供的参考文档内容，其中并未包含关于如何具体定义路径参数和查询参数的代码示例或分步说明。文档主要概述了FastAPI的框架特性。\n\n不过，从文档中可以得知以下相关信息，这些信息与参数处理密切相关：\n\n1.  **路由与请求方法**：文档明确指出 FastAPI 支持所有 HTTP 请求方法：`GET、POST、PUT、DELETE、PATCH、HEAD、OPTIONS、TRACE`。路径参数",
+      "elapsed": 11.3,
+      "source_count": 30,
+      "passed": false,
+      "reason": "回答含否定表述但关键词存在，可能检索正确但生成失败",
+      "matched_keywords": [
+        "路径参数",
+        "查询参数"
+      ],
+      "score": 33,
+      "keyword_ratio": 0.67
+    },
+    {
+      "question": "RAG 的全称是什么？它解决 LLM 的哪些问题？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档内容，我将对您提出的问题进行完整回答。\n\n### 1. RAG 的全称\nRAG 的全称是 **Retrieval-Augmented Generation**，中文译为 **检索增强生成**。\n\n> **来源依据**：在片段 [16]、[17]、[18] 中明确指出：“RAG（Retrieval-Augmented Generation，检索增强生成）是一种将**信息检索**与*",
+      "elapsed": 9.71,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "Retrieval-Augmented Generation",
+        "检索增强生成",
+        "幻觉",
+        "时效性"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "RAG 的基本流程包含哪三个阶段？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，RAG（检索增强生成）的基本流程包含以下三个阶段：\n\n1.  **索引阶段**：将外部知识文档切分成小片段（Chunk），通过 Embedding 模型转化为向量，存储到向量数据库中。\n2.  **检索阶段**：用户提问时，将问题转为向量，在向量数据库中检索最相关的文档片段。\n3.  **生成阶段**：将检索到的相关片段作为上下文，拼接到 Prompt 中，让 LLM 基于这些",
+      "elapsed": 7.56,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "索引",
+        "检索",
+        "生成",
+        "Embedding"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "RAG 系统中常用的 Embedding 模型有哪些？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，RAG 系统中常用的 Embedding 模型如下：\n\n### 常见 Embedding 模型列表\n以下模型直接来自文档中的表格（片段 [22], [23], [24]）：\n\n| 模型 | 维度 | 特点 |\n|------|------|------|\n| **OpenAI text-embedding-3-small** | 1536 | 性能好，需联网 |\n| **Ope",
+      "elapsed": 10.28,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "text-embedding",
+        "nomic-embed",
+        "bge-large-zh",
+        "m3e"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "RAG 中向量相似度通常用什么方法计算？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档内容，**没有具体提及RAG系统中向量相似度的计算方法**。\n\n文档主要阐述了RAG的基本思想和流程，其中涉及向量检索的环节，但未说明具体的相似度计算技术。例如，文档[10][11][12]提到了“在向量数据库中检索最相关的文档片段”，但未定义“相关”是如何通过算法度量的。\n\n因此，基于现有文档，无法回答您关于向量相似度计算方法的具体问题。",
+      "elapsed": 9.76,
+      "source_count": 30,
+      "passed": false,
+      "reason": "回答表示不知道，检索可能失败",
+      "matched_keywords": [],
+      "score": 10,
+      "keyword_ratio": 0.0
+    },
+    {
+      "question": "Chroma 向量数据库使用什么索引算法？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，Chroma 向量数据库使用的索引算法是 **HNSW（Hierarchical Navigable Small World）**。\n\n以下是文档中的具体信息：\n\n1.  **算法名称与描述**：文档明确指出，Chroma 使用 HNSW 算法进行近似最近邻搜索。这是一种基于图的高效索引结构，能够在毫秒级别完成百万级向量的检索。\n    > [4] Chroma 使用 HNSW",
+      "elapsed": 9.57,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "HNSW",
+        "近似最近邻"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "RAG 中 chunk_size 推荐设置为多少？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，RAG（检索增强生成）系统中 **chunk_size（片段大小）的推荐设置如下**：\n\n1.  **通用推荐范围**：通常设置为 **500-1000 字符**。\n    *   **原因**：片段太大会导致检索不精确，片段太小则缺乏必要的上下文。\n\n2.  **具体代码示例推荐值**：文档中提供的一个推荐配置示例，将 `chunk_size` 设置为 **800**。\n  ",
+      "elapsed": 10.69,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "500",
+        "1000",
+        "字符"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "RAG 中 chunk_overlap 的作用是什么？推荐比例是多少？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，RAG 中 `chunk_overlap` 的作用和推荐比例如下：\n\n**作用**：`chunk_overlap`（重叠大小）的主要作用是**避免信息在片段边界处丢失**（参考片段 [1]、[2]、[3]）。\n\n**推荐比例**：文档中推荐的 `chunk_overlap` 大小通常为 `chunk_size`（片段大小）的 **10% 到 20%**（参考片段 [1]、[2]",
+      "elapsed": 9.43,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "重叠",
+        "overlap",
+        "10%",
+        "20%"
+      ],
+      "score": 100,
+      "keyword_ratio": 1.0
+    },
+    {
+      "question": "什么是 Query Rewriting？它在 RAG 中起什么作用？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，以下是关于 **Query Rewriting（查询改写）** 及其在 **RAG** 中作用的详细说明：\n\n### 1. 什么是 Query Rewriting？\nQuery Rewriting 是指**将用户当前问题结合对话历史，改写为一个独立的、语义完整的问题**的过程。\n\n### 2. 为什么需要 Query Rewriting？\n在多轮对话场景中，用户经常会使用指代词",
+      "elapsed": 13.25,
+      "source_count": 30,
+      "passed": true,
+      "reason": "关键词匹配充分，回答正确",
+      "matched_keywords": [
+        "查询改写",
+        "指代",
+        "省略"
+      ],
+      "score": 90,
+      "keyword_ratio": 0.75
+    },
+    {
+      "question": "RAG 系统的评估指标有哪些？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档片段，关于“RAG 系统的评估指标有哪些？”这一问题，文档中直接相关的部分出现在片段 [4]、[5] 和 [6]，内容均为：“评估 RAG 系统的效果通常从以下维度衡量：”，但未列出具体的维度或指标项目。其他文档片段（如关于 RAG 定义、核心思想、文档分割策略、Prompt 工程等）均未提供评估指标的具体细节。\n\n因此，基于所有参考文档内容，可以确认文档中提到了评估 RAG 系",
+      "elapsed": 18.76,
+      "source_count": 30,
+      "passed": false,
+      "reason": "关键词匹配率低",
+      "matched_keywords": [],
+      "score": 0,
+      "keyword_ratio": 0.0
+    },
+    {
+      "question": "RAG 的标准 Prompt 结构包含哪些要素？",
+      "source": "test_rag_introduction.md",
+      "answer": "根据提供的参考文档，RAG（检索增强生成）技术的标准Prompt结构包含以下要素和具体要求：\n\n### 1. 标准RAG Prompt结构示例\n文档中提供了标准RAG Prompt的示例代码，其结构如下：\n```text\n你是一个智能问答助手。请根据以下提供的参考文档内容，回答用户的问题。\n如果参考文档中没有相关信息，请明确说明你不知道，不要编造答案。\n```\n\n### 2. 核心设计要点\n文档明",
+      "elapsed": 12.58,
+      "source_count": 30,
+      "passed": false,
+      "reason": "回答含否定表述但关键词存在，可能检索正确但生成失败",
+      "matched_keywords": [
+        "角色设定",
+        "参考文档",
+        "约束条件",
+        "来源引用"
+      ],
+      "score": 50,
+      "keyword_ratio": 1.0
+    }
+  ]
+}
