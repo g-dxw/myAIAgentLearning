@@ -151,3 +151,18 @@ class VectorStore:
             if meta and "doc_id" in meta:
                 doc_ids.add(meta["doc_id"])
         return sorted(doc_ids)
+
+    def get_all(self) -> list[dict]:
+        """获取所有 chunk（用于全文关键词搜索）"""
+        results = self.collection.get(include=["documents", "metadatas"])
+        formatted = []
+        ids = results.get("ids", [])
+        docs = results.get("documents", [])
+        metas = results.get("metadatas", [])
+        for id_, doc, meta in zip(ids, docs, metas):
+            formatted.append({
+                "id": id_,
+                "text": doc or "",
+                "metadata": meta or {},
+            })
+        return formatted
