@@ -1,14 +1,14 @@
-# Day 05 — 持久化与人机交互：Checkpointer / interrupt
+# Day 05 — 持久化：Checkpointer / Store / interrupt
 
 ## 学习目标
 
-Day 04 我们用条件边 + 循环把 Agent Loop 编排成了一张可执行的图，但这张图还活在内存里——进程一重启，对话历史、中间状态、执行到哪一步全部蒸发；更别提遇到"删除路线"这种危险操作，Agent 一路冲到底没人拦得住。今天给图装上两个生产级特性：**Checkpointer 持久化**（每个节点执行后自动给状态存档，重启/中断后能从断点恢复）和 **human-in-the-loop 的 interrupt**（在节点内暂停执行，等人确认后再用 `Command(resume=...)` 恢复）。这两个能力是手写 Agent Loop 永远做不到的——因为它们依赖"图执行引擎"对状态的可观测、可存档、可恢复的掌控。学完今天你的 Agent 才算从"能跑的玩具"走向"敢上生产的工具"。
+Day 04 我们用条件边 + 循环把 Agent 编排成了一张可执行的图，但这张图还活在内存里——进程一重启，对话历史、中间状态全部蒸发；更别提"删除路线"这种危险操作，Agent 一路冲到底没人拦得住；再进一步，每个用户的知识（偏好、已保存路线）只活在当前会话，换个 thread 就不认人。今天给图装上生产级的三件套：**Checkpointer 短时记忆**（每个节点后自动存档状态，重启/中断后能从断点恢复）、**Store 长期记忆**（跨会话持久读取/写入用户数据，同一个 store 多 thread 共享）、**interrupt 人机交互**（在节点内暂停执行，等人确认后再用 `Command(resume=...)` 恢复）。这三者加起来，你的 Agent 才算从"一次性的对话脚本"走向"有状态、可恢复、知人识面"的生产级应用。
 
 学完今天你能：
-1. 说清楚 Checkpointer 的存档机制（每个节点执行后自动保存状态快照），并区分 `MemorySaver`（内存，重启丢失）与 `SqliteSaver`（SQLite，持久化）的适用场景，能默写 `compile(checkpointer=...)` + `config={"configurable": {"thread_id": ...}}` 的标准用法
-2. 用同一个 `thread_id` 多次 `invoke` 实现多轮对话记忆，对比 Week 03 手动维护 `messages` 列表的痛苦，说清"状态存档 = 记忆"的本质
-3. 用 `app.get_state(config)` 查看当前状态、用 `state.next` 定位卡在哪个节点、用 `app.update_state(config, values)` 手动改状态，把这套当成调试断点恢复的利器
-4. 用 `interrupt()` 在危险操作前暂停图执行，等人工确认后用 `Command(resume=...)` 恢复，完成"删除路线前要人确认"的完整人机交互闭环
+1. 说清楚 LangGraph 持久化的两个层次——Checkpointer（短时/会话级）和 Store（长期/跨会话级），并默写对比表（作用域/生命周期/访问方式/使用场景）
+2. 用 `InMemorySaver` 挂载 Checkpointer，用 `thread_id` 标识会话，通过同一 thread 多次 `invoke` 实现多轮对话记忆，对比 Week 03 手动维护 `messages` 列表的差异
+3. 用 `InMemoryStore` 创建跨会话长期记忆，在 tool 内通过 `runtime.store.get/put` 读写持久化数据，验证同一 store 下不同 thread 共享用户信息
+4. 用 `interrupt(payload)` 在危险操作前暂停图执行，用 `Command(resume=value)` 恢复，完成"删除路线前要人确认"的完整人机交互闭环；会用 `agent.get_state(config)` 查看状态/定位断点，用 `agent.update_state(config, values)` 手动修正状态
 
 ---
 
@@ -22,111 +22,120 @@ Day 04 我们用条件边 + 循环把 Agent Loop 编排成了一张可执行的�
 |------|------|
 | 进程重启 / 服务器重新部署 | 整个对话历史清零，用户得从头再说一遍 |
 | 跑到一半抛异常崩溃 | 已经执行了几步的工具调用结果全没，没法续跑 |
-| 长任务中途想暂停（比如要等人确认） | 内存里的状态没法"挂起"，只能要么跑完要么放弃 |
-| 同一个用户开了多个会话 | 没有"会话隔离"，状态全混在一个 list 里 |
+| 长任务中途想暂停（如要等人确认） | 内存里的状态没法"挂起"，只能要么跑完要么放弃 |
+| 同一用户开了多个会话 | 没有"会话隔离"，状态全混在一个 list 里 |
+| 想跨会话记住用户偏好 | 每次都是陌生人，没有"长期记忆" |
 
-Week 03 我们靠手动把 `messages` 序列化存盘来缓解，但那是**侵入式的**——业务代码里到处塞 `json.dump`，而且只能存"最终结果"，存不了"执行到哪一步"这种过程状态。
+Week 03 我们靠手动把 `messages` 序列化存盘来缓解，但那是**侵入式的**——业务代码里到处塞 `json.dump`，而且只能存"最终结果"，存不了"执行到哪一步"这种过程状态，更不用说"跨会话共享记忆"了。
 
-### 1.2 无持久化 vs 有持久化
+### 1.2 LangGraph 持久化的两个层次
 
-LangGraph 的 Checkpointer 把存档这件事从业务代码里彻底抽出来，下沉到执行引擎层：
+LangGraph 把持久化拆成了**两个正交的层次**，各自解决不同的问题：
 
-| 维度 | 无持久化（Week 03 / Day 04） | 有持久化（Checkpointer） |
-|------|----------------------------|------------------------|
-| 存档时机 | 手动 `json.dump`，只能存最终结果 | 每个节点执行后**自动**存档中间状态 |
-| 重启恢复 | ❌ 重启即丢，从头再来 | ✅ 用同一 `thread_id` 续跑，状态完整 |
-| 多会话隔离 | ❌ 自己管 session_id，容易串 | ✅ `thread_id` 天然隔离，互不干扰 |
-| 断点恢复 | ❌ 崩溃后无法续跑 | ✅ 从最近一次存档点恢复 |
-| 人机交互挂起 | ❌ 内存状态没法"暂停等输入" | ✅ `interrupt` 挂起，状态留在检查点 |
-| 业务侵入 | 高（到处塞存盘代码） | 零（`compile(checkpointer=...)` 一行） |
+| 维度 | Checkpointer（短时记忆） | Store（长期记忆） |
+|------|------------------------|-----------------|
+| **存储内容** | 图的完整状态快照（messages、节点状态、next 指针） | 应用级结构化数据（用户偏好、学识、配置） |
+| **作用域** | 会话级（一个 thread_id 一套快照链） | 跨会话（同一 store 下所有 thread 可见） |
+| **生命周期** | 会话结束可丢弃（或保留用于时间旅行） | 持久保留，应用生命周期 |
+| **访问方式** | 引擎自动读/写，开发者无须手动操作 | 通过 tool 内的 `runtime.store` 手动 get/put |
+| **核心 API** | `compile(checkpointer=...)` + `thread_id` | `InMemoryStore()` + `compile(store=store)` |
+| **类比** | Web 应用的 Session 存储器 | 应用数据库 |
+| **重启后** | 用 MemorySaver 会丢，用 SqliteSaver/PostgresSaver 不丢 | 用 InMemoryStore 会丢，用持久化 Store 实现不丢 |
+| **使用场景** | 多轮对话记忆、中断恢复、时间旅行 | 用户偏好、已保存路线、知识图谱 |
 
-> **关键认知：** Checkpointer 存的不是"对话记录"，而是**图的完整状态快照（State Snapshot）**——包括 messages、业务字段、当前执行到哪个节点、下一步要往哪走。这意味着哪怕图执行到一半被杀掉，重启后引擎知道"上次停在 `respond` 节点之前，下一步该执行 `respond`"。
+> **关键认知：** Checkpointer 存的是"图执行的足迹"（方便续跑和回溯），Store 存的是"业务需要的持久数据"（用户偏好、学识记忆）。两者互补，不重叠。同一个应用往往两个都用——Checkpointer 负责让对话能接上，Store 负责让 Agent 记住用户的长期偏好。
+
+### 1.3 无持久化 vs 有持久化（全貌）
+
+| 维度 | 无持久化（Week 03 / Day 04） | 有 Checkpointer | 有 Checkpointer + Store |
+|------|----------------------------|----------------|----------------------|
+| 存档时机 | 手动 `json.dump`，只能存最终结果 | 每个节点后**自动**存档中间状态 | 同上 + 手动持久化业务数据 |
+| 重启恢复 | 重启即丢 | 同一 thread_id 可续跑 | 恢复后还能从 Store 读取用户数据 |
+| 多会话隔离 | 自己管 session_id | thread_id 天然隔离 | 隔离 + 共享 Store 中的公共数据 |
+| 断点恢复 | 崩溃后无法续跑 | 从最近检查点恢复 | 恢复后 Store 数据仍在 |
+| 人机交互 | 没法暂停 | interrupt 挂起，状态存档 | 中断时 Store 数据也可读 |
+| 业务侵入 | 高（到处塞存盘代码） | 零（`compile(checkpointer=...)` 一行） | 极低（tool 内通过 runtime.store 访问） |
 
 ---
 
-## 二、Checkpointer 机制：每个节点后自动存档
+## 二、Checkpointer 基础：短时记忆
 
-### 2.1 存档发生在哪
+### 2.1 Checkpointer 的存档机制
 
 Checkpointer 的工作原理一句话：**图在每执行完一个节点、状态合并完成后，就把当前全状态写一份快照到检查点存储里。** 这个过程对业务代码完全透明——你照常 `add_node` / `add_edge` / `invoke`，存档是引擎自动做的。
 
 ```
 节点执行 + 状态存档的时间线
 
-START ──► [node_a 执行] ──► 合并 state ──► ✅ 存档快照 #1
+START ──► [node_a 执行] ──► 合并 state ──► 存档快照 #1
                                     │
                                     ▼
-        [node_b 执行] ──► 合并 state ──► ✅ 存档快照 #2
+        [node_b 执行] ──► 合并 state ──► 存档快照 #2
                                     │
                                     ▼
-        [node_c 执行] ──► 合并 state ──► ✅ 存档快照 #3 ──► END
+        [node_c 执行] ──► 合并 state ──► 存档快照 #3 ──► END
 
 崩溃发生在 node_c 之后？重启时从快照 #3 恢复，知道下一步是 END。
 ```
 
-### 2.2 MemorySaver vs SqliteSaver
+### 2.2 InMemorySaver vs 生产方案
 
-LangGraph 提供多种 Checkpointer 实现，本周掌握两种就够：
-
-| 维度 | MemorySaver | SqliteSaver |
-|------|-------------|-------------|
-| 导入 | `from langgraph.checkpoint.memory import MemorySaver` | `from langgraph.checkpoint.sqlite import SqliteSaver` |
-| 存储 | 进程内存 | SQLite 文件（`checkpoints.sqlite`） |
-| 重启后 | ❌ 丢失（内存清空） | ✅ 保留（落盘了） |
+| 维度 | InMemorySaver（开发用） | SqliteSaver / PostgresSaver（生产用） |
+|------|------------------------|--------------------------------------|
+| 导入路径 | `from langgraph.checkpoint.memory import InMemorySaver` | `from langgraph.checkpoint.sqlite import SqliteSaver`（依具体实现） |
+| 存储 | 进程内存 | SQLite 文件 / PostgreSQL 表 |
+| 重启后 | 丢失（内存清空） | 保留（落盘/落库） |
 | 适用 | 开发调试、单次会话原型 | 生产、需要跨重启续跑 |
-| 性能 | 最快（无 IO） | 略慢（有磁盘写） |
-| 并发 | 单进程 | SQLite 文件锁，适合中小并发 |
+| 性能 | 最快（无 IO） | 略慢（有磁盘/网络 IO） |
+| 并发 | 单进程 | SQLite 有文件锁，Postgres 支持高并发 |
 
-经验法则：**开发阶段用 MemorySaver 图个快，上线前切 SqliteSaver（或 PostgresSaver）做真持久化**。切换只需改一行 checkpointer 实例，业务代码零改动。
+> **注意：** `MemorySaver` 已在 2026 年更名为 `InMemorySaver`，`from langgraph.checkpoint.memory import MemorySaver` 已废弃。如果遇到 ImportError，请改用上面的新名。
 
-### 2.3 compile(checkpointer=...) + thread_id 标准用法
+### 2.3 Checkpointer 基础用法：create_agent 模式
+
+2026 年起推荐用 `create_agent` 构造带 Checkpointer 的 Agent，比手动拼 StateGraph 更简洁：
 
 ```python
-"""checkpointer 基础用法：编译时挂上 checkpointer，调用时带 thread_id"""
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing import Annotated, TypedDict
+"""checkpointer_basic.py — Checkpointer 基础用法：create_agent + InMemorySaver"""
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import InMemorySaver
 
 
-class ChatState(TypedDict):
-    messages: Annotated[list, add_messages]
+# 1. 创建模型
+model = init_chat_model("gpt-4o-mini", temperature=0)
 
+# 2. 创建 Checkpointer 实例
+checkpointer = InMemorySaver()
 
-def echo_node(state: ChatState) -> dict:
-    """简单回显节点：把用户的话原样回一遍。"""
-    last = state["messages"][-1].content
-    return {"messages": [{"role": "assistant", "content": f"你说的是：{last}"}]}
-
-
-# 1. 建图
-graph = StateGraph(ChatState)
-graph.add_node("echo", echo_node)
-graph.add_edge(START, "echo")
-graph.add_edge("echo", END)
-
-# 2. 编译时挂上 checkpointer —— 这是今天的关键一行
-checkpointer = MemorySaver()
-app = graph.compile(checkpointer=checkpointer)
-
-# 3. 调用时必须带 config，里面塞 thread_id
-#    thread_id = 会话标识，不同对话用不同 id，互不干扰
-config = {"configurable": {"thread_id": "user-001"}}
-
-result = app.invoke(
-    {"messages": [{"role": "user", "content": "你好"}]},
-    config=config,   # ← 带 checkpointer 调用，状态自动存档
+# 3. 编译 Agent 时传入 checkpointer
+agent = create_agent(
+    model,
+    tools=[],                          # 暂无工具，后续再加
+    checkpointer=InMemorySaver(),      # 直接传实例
 )
-print(result["messages"][-1]["content"])   # 你说的是：你好
+
+# 4. 定义 thread_id = 会话标识
+config = {"configurable": {"thread_id": "session-001"}}
+
+# 5. 第一次 invoke
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "你好，我叫小明"}]},
+    config=config,
+)
+print(result["messages"][-1].content)
+
+# 6. 第二次 invoke（同一 thread_id，自动记忆上下文）
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "我叫什么名字？"}]},
+    config=config,      # 同一 thread_id → Checkpointer 自动带历史
+)
+print(result["messages"][-1].content)   # 应该答出"小明"
 ```
 
 > **关键认知：** `thread_id` 是 Checkpointer 的"会话主键"。引擎用 `(thread_id, checkpoint_id)` 给每个快照编址。同一个 `thread_id` 下的多次 `invoke` 共享同一份状态历史；换一个 `thread_id` 就是开了一个全新会话，互不干扰。可以把它理解成"聊天窗口的 session id"。
 
----
-
-## 三、多轮对话记忆：同一 thread_id 多次 invoke
-
-### 3.1 对比 Week 03 手动维护 messages
+### 2.4 多轮对话记忆：同一 thread_id 多次 invoke
 
 Week 03 做多轮对话，我们必须自己把上一轮的 messages 带进下一轮：
 
@@ -140,63 +149,40 @@ messages.append(call_llm(messages))               # 手动加第二轮回复
 # 多用户？自己管 session_id → messages 的映射字典。
 ```
 
-这套手写方案能跑，但每加一个用户、每多一轮对话、每次重启，都要写一堆胶水代码，还容易把 session 串了。
-
-### 3.2 Checkpointer 让"状态存档 = 记忆"
-
-有了 Checkpointer，多轮对话变成"用同一个 `thread_id` 多次 `invoke`"——引擎会自动把上一轮的最终状态作为这一轮的起点，messages 自然就累积下来了：
+有了 Checkpointer，多轮对话变成"用同一个 `thread_id` 多次 `invoke`"——引擎会自动把上一轮的最终状态作为这一轮的起点：
 
 ```python
-"""多轮对话：同一 thread_id 多次 invoke，历史自动保留"""
+"""多轮对话 demo：同 thread_id 多次 invoke，历史自动保留"""
+from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from typing import Annotated, TypedDict
-
-
-class ChatState(TypedDict):
-    messages: Annotated[list, add_messages]
+from langgraph.checkpoint.memory import InMemorySaver
 
 
 model = init_chat_model("gpt-4o-mini", temperature=0)
+agent = create_agent(model, tools=[], checkpointer=InMemorySaver())
 
-
-def chat_node(state: ChatState) -> dict:
-    """LLM 节点：把全部历史发给模型，回复追加到 messages。"""
-    response = model.invoke(state["messages"])
-    return {"messages": [response]}
-
-
-graph = StateGraph(ChatState)
-graph.add_node("chat", chat_node)
-graph.add_edge(START, "chat")
-graph.add_edge("chat", END)
-
-app = graph.compile(checkpointer=MemorySaver())
 config = {"configurable": {"thread_id": "conv-001"}}
 
-# 第一轮：注意只传"本轮新消息"，历史由 checkpointer 从存档补回来
-app.invoke(
+# 第一轮：只传"本轮新消息"，历史由 checkpointer 从存档补回来
+agent.invoke(
     {"messages": [
-        SystemMessage(content="你是一个简洁的徒步助手。"),
-        HumanMessage(content="川西有哪些入门雪山？"),
+        {"role": "system", "content": "你是一个简洁的徒步助手。"},
+        {"role": "user", "content": "川西有哪些入门雪山？"},
     ]},
     config=config,
 )
 
 # 第二轮：只传本轮的新问题，引擎自动带上第一轮的全部历史
-r2 = app.invoke(
-    {"messages": [HumanMessage(content="那第一条路线需要什么装备？")]},
+r2 = agent.invoke(
+    {"messages": [{"role": "user", "content": "那第一条路线需要什么装备？"}]},
     config=config,   # 同一个 thread_id → 自动记得第一轮聊过什么
 )
 print(r2["messages"][-1].content)   # 模型能正确引用"第一条路线"
 
 # 第三轮：换个 thread_id，开新会话，历史是空的
 config_b = {"configurable": {"thread_id": "conv-002"}}
-r3 = app.invoke(
-    {"messages": [HumanMessage(content="那第一条路线需要什么装备？")]},
+r3 = agent.invoke(
+    {"messages": [{"role": "user", "content": "那第一条路线需要什么装备？"}]},
     config=config_b,
 )
 # r3 里模型不知道"第一条路线"指什么，因为 conv-002 是全新会话
@@ -209,22 +195,217 @@ r3 = app.invoke(
 | 存盘恢复 | 自己 json.dump/load | 引擎自动存，重启续跑 |
 | 业务侵入 | 高（到处是胶水） | 零（只改 config） |
 
-> **关键认知：** 第二轮 `invoke` 时只传了"本轮新消息"，但模型回答时却能"记得"第一轮——这是因为引擎在执行 `chat_node` 前，先把存档里的历史 messages 合并进了当前状态。**记忆的本质就是状态存档**，这是 Checkpointer 送给多轮对话最大的礼物。
+> **关键认知：** 第二轮 `invoke` 时只传了"本轮新消息"，但模型回答时却能"记得"第一轮——这是因为引擎在执行节点前，先把存档里的历史 messages 合并进了当前状态。**会话记忆的本质就是状态存档**，这是 Checkpointer 送给多轮对话最大的礼物。
 
 ---
 
-## 四、状态查看与修改：调试利器
+## 三、Store 长期记忆（重点——新概念）
+
+### 3.1 为什么需要 Store
+
+Checkpointer 解决了"会话内能延续"的问题，但有一个局限：**它的作用域是 thread 级别的**。同一个 thread 的历史可以累积，但换了 thread（即使还是同一个用户），Checkpointer 里存的 messages 就访问不到了。
+
+但很多场景需要**跨会话的长期记忆**：
+- 用户在 thread A 设置了"我偏好难度适中的徒步路线"，在 thread B 里 Agent 应该记得这个偏好
+- 用户保存了一条路线到"我的收藏"，下次任何会话都能读到
+- 系统需要累积用户的学识水平，跨多天跟踪进步
+
+这就是 Store 的用武之地。Store 是一个**键值存储引擎**，独立于 Checkpointer 存在，所有 thread 共享同一份数据。
+
+### 3.2 InMemoryStore 的基本操作
+
+```python
+"""store_basic.py — InMemoryStore 跨会话长期记忆"""
+from langgraph.store.memory import InMemoryStore
+
+
+# 1. 创建 Store（开发阶段用 InMemoryStore，生产可换持久化后端）
+store = InMemoryStore()
+
+# 2. 写数据：store.put(namespace, key, value)
+#    namespace 是元组，用于逻辑分组，如 ("users",)
+#    key 是字符串标识符
+#    value 是任意可 JSON 序列化的 dict
+store.put(("users",), "user_123", {"name": "小明", "preference": "中等难度"})
+
+# 3. 读数据：store.get(namespace, key)
+item = store.get(("users",), "user_123")
+print(item.value)   # {"name": "小明", "preference": "中等难度"}
+
+# 4. 搜索：store.search(namespace, filters)
+#    返回同一 namespace 下匹配 filter 的条目
+results = store.search(("users",), filter={"preference": "中等难度"})
+for item in results:
+    print(item.key, item.value)
+```
+
+Store 的数据结构非常直观：
+
+| 概念 | 说明 | 示例 |
+|------|------|------|
+| namespace | 逻辑分组，元组形式，类似文件夹 | `("users",)`、`("users", "preferences")` |
+| key | 条目唯一标识，字符串 | `"user_123"`、`"route_456"` |
+| value | 存储的值，可 JSON 序列化的 dict | `{"name": "小明", "level": "中级"}` |
+| get | 精确读取 | `store.get(("users",), "user_123")` |
+| put | 写入/更新 | `store.put(("users",), "user_123", {...})` |
+| search | 按 namespace + filter 搜索 | `store.search(("users",), filter={"level": "中级"})` |
+
+### 3.3 在 create_agent 中挂载 Store
+
+Store 需要和 Checkpointer 一起传入 `create_agent`，两者相辅相成：
+
+```python
+"""agent_with_store.py — create_agent 同时挂载 Checkpointer + Store"""
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+
+model = init_chat_model("gpt-4o-mini", temperature=0)
+
+# 创建 Checkpointer（短时记忆）
+checkpointer = InMemorySaver()
+
+# 创建 Store（长期记忆）
+store = InMemoryStore()
+
+# 编译 Agent，同时传入 checkpointer 和 store
+agent = create_agent(
+    model,
+    tools=[],                # 工具稍后加上
+    checkpointer=checkpointer,
+    store=store,             # ← Store 参数
+)
+```
+
+> **注意：** `store` 必须和 `checkpointer` 同时传入才能正常工作。Store 不依赖 Checkpointer 的 thread 隔离——它是全局共享的，所有 thread 读写同一份数据。
+
+### 3.4 在 tool 内通过 runtime.store 读写 Store
+
+挂载了 Store 之后，tool 函数可以通过 `runtime.store` 访问 Store。这是最关键的模式：
+
+```python
+"""tool 内使用 runtime.store 的完整示例"""
+from langchain.agents import create_agent, tool
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
+
+
+# 1. 定义一个 tool，通过 runtime.store 读写用户偏好
+@tool
+def save_user_preference(runtime, preference: str) -> str:
+    """
+    保存用户对徒步路线的偏好（难度、类型等）。
+
+    runtime.store 由 LangGraph 引擎自动注入。
+    该数据跨会话持久，其他 thread 也能读到。
+    """
+    # 从 config 中获取用户标识（实际项目从 token 解析）
+    user_id = runtime.config.get("configurable", {}).get("user_id", "anonymous")
+
+    # 读取已有偏好
+    existing = runtime.store.get(("users",), user_id)
+    prefs = existing.value if existing else {}
+
+    # 更新偏好
+    prefs["preference"] = preference
+    runtime.store.put(("users",), user_id, prefs)
+
+    return f"已保存偏好：{preference}"
+
+
+@tool
+def get_user_preference(runtime) -> str:
+    """
+    读取用户保存的徒步偏好。
+
+    注意：这个 tool 可以在完全不同的 thread 中调用，
+    但只要 store 是同一个实例，数据就能读到。
+    """
+    user_id = runtime.config.get("configurable", {}).get("user_id", "anonymous")
+    existing = runtime.store.get(("users",), user_id)
+    if existing:
+        return f"你的偏好：{existing.value.get('preference', '未设置')}"
+    return "还未设置偏好"
+
+
+# 2. 编译 Agent
+model = init_chat_model("gpt-4o-mini", temperature=0)
+agent = create_agent(
+    model,
+    tools=[save_user_preference, get_user_preference],
+    checkpointer=InMemorySaver(),
+    store=InMemoryStore(),
+)
+
+# 3. 线程 A：用户设置偏好
+config_a = {"configurable": {"thread_id": "thread-a", "user_id": "user_123"}}
+agent.invoke(
+    {"messages": [{"role": "user", "content": "我喜欢中等难度的徒步路线"}]},
+    config=config_a,
+)
+
+# 4. 线程 B：同一用户换了个会话，Agent 还记得偏好
+config_b = {"configurable": {"thread_id": "thread-b", "user_id": "user_123"}}
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "帮我看看我的偏好是什么"}]},
+    config=config_b,   # 不同 thread_id，但同一 store → 数据共享
+)
+print(result["messages"][-1].content)   # 应该答出"中等难度"
+```
+
+> **关键认知：** `runtime.store` 的注入是 LangGraph 引擎自动完成的。你不需要手动传递 store 实例到 tool 里。只要在 `create_agent` 时传入 `store=...`，所有 tool 函数就能通过 `runtime.store` 访问。**Store 的跨 thread 共享**是它与 Checkpointer 最本质的区别——同一 store 实例下，thread A 写的数据 thread B 能读到。
+
+### 3.5 Checkpointer 与 Store 的协作关系
+
+```
+                ┌─────────────────────────────────────────┐
+                │           Agent Runtime                  │
+                │                                          │
+                │  ┌─────────────────┐  ┌──────────────┐  │
+                │  │  Checkpointer   │  │    Store     │  │
+                │  │  (短时,会话级)   │  │  (长期,全局)  │  │
+                │  │                 │  │              │  │
+                │  │  thread_a 存档   │  │  ("users",   │  │
+                │  │  thread_b 存档   │  │   user_123)  │  │
+                │  │  thread_c 存档   │  │  ("routes",  │  │
+                │  │                 │  │   route_456) │  │
+                │  └─────────────────┘  └──────────────┘  │
+                │                                          │
+                └──────────────────────────────────────────┘
+                           ▲           ▲
+                           │           │
+                ┌──────────┴───────────┴──────────┐
+                │          Thread A               │
+                │  get_state → 读取 thread 快照    │
+                │  runtime.store → 读取全局数据    │
+                └─────────────────────────────────┘
+```
+
+| 维度 | Checkpointer | Store |
+|------|-------------|-------|
+| 作用域 | 单 thread（会话级） | 全局（跨会话） |
+| 读写方式 | 引擎自动（对开发者透明） | 开发者手动（tool 内通过 runtime.store） |
+| 典型数据 | messages、节点执行状态 | 用户偏好、配置、学识 |
+| 生命周期 | 随会话创建/结束 | 随应用创建/销毁 |
+| 依赖关系 | 独立 | 依赖 Checkpointer 提供 config 上下文 |
+
+---
+
+## 四、State 查看与修改：调试利器
 
 ### 4.1 get_state：看当前状态长什么样
 
-Checkpointer 不光会存档，还允许你随时"偷看"当前状态。这是调试断点恢复的核心入口：
+Checkpointer 不光会存档，还允许你随时**偷看**当前状态。这是调试断点恢复的核心入口：
 
 ```python
-"""get_state / next / update_state 三件套"""
-# 接续第三节的 app 和 config（conv-001）
+"""get_state / update_state 调试三件套"""
+# 接续上面 agent 和 config
 
 # 1. get_state：查看当前会话的完整状态快照
-snapshot = app.get_state(config)
+snapshot = agent.get_state(config)
 print(snapshot.values)        # 当前全状态 dict（含 messages、业务字段）
 print(snapshot.next)          # 下一步要执行的节点元组，() 表示已结束
 print(snapshot.config)        # 这份快照对应的 config
@@ -232,7 +413,7 @@ print(snapshot.config)        # 这份快照对应的 config
 
 ### 4.2 next 字段：定位"卡在哪"
 
-`state.next` 是调试时最该盯的字段。它告诉你**图现在停在哪、下一步该走哪个节点**：
+`snapshot.next` 是调试时最该盯的字段。它告诉你**图现在停在哪、下一步该走哪个节点**：
 
 | `snapshot.next` 的值 | 含义 | 排查方向 |
 |---------------------|------|---------|
@@ -241,37 +422,37 @@ print(snapshot.config)        # 这份快照对应的 config
 | `("tools",)` | 停在 tools 节点前 | 检查是不是 interrupt 挂起了，等人确认 |
 | `("node_a", "node_b")` | 多个节点待执行 | 并行节点场景，检查是否都就绪 |
 
-当 Agent "卡住不动"时，第一步永远是 `print(app.get_state(config).next)`——它直接告诉你卡在哪个节点。
+当 Agent "卡住不动"时，第一步永远是 `print(agent.get_state(config).next)`——它直接告诉你卡在哪个节点。
 
 ### 4.3 update_state：手动改状态再续跑
 
 `update_state` 允许你**绕过节点逻辑、直接改状态**，然后让图从新状态继续。这是人工干预的底牌：
 
 ```python
-# 2. update_state：手动改状态（比如修正一个错误的中分类结果）
-app.update_state(
+# 2. update_state：手动改状态（比如修正一个错误）
+agent.update_state(
     config,
-    values={"messages": [HumanMessage(content="（人工修正）刚才那条忽略，改成问装备")]},
+    values={"messages": [{"role": "user", "content": "（人工修正）刚才那条忽略，改成问装备"}]},
 )
-# 改完后 get_state 能看到新值，下次 invoke 会从新状态继续
+# 改完后 get_state 能看到新值
 
 # 3. 续跑：从修正后的状态继续执行
-result = app.invoke(None, config=config)   # 传 None 表示"不追加新输入，接着跑"
+result = agent.invoke(None, config=config)   # 传 None = 不追加新输入，接着跑
 print(result["messages"][-1].content)
 ```
 
 | 操作 | API | 典型用途 |
 |------|-----|---------|
-| 查看状态 | `app.get_state(config)` | 调试时看 messages / 业务字段对不对 |
+| 查看状态 | `agent.get_state(config)` | 调试时看 messages / 业务字段对不对 |
 | 看下一步 | `snapshot.next` | 定位卡在哪个节点 |
-| 改状态 | `app.update_state(config, values)` | 人工修正错误状态后续跑 |
-| 续跑 | `app.invoke(None, config=config)` | 从断点/修正点继续执行 |
+| 改状态 | `agent.update_state(config, values)` | 人工修正错误状态后续跑 |
+| 续跑 | `agent.invoke(None, config=config)` | 从断点/修正点继续执行 |
 
 > **关键认知：** `get_state` / `update_state` 把"图执行"从黑盒变成了白盒。Week 03 手写循环时，你想看中间状态只能在循环体里塞 `print`；现在引擎把每一步状态都存档了，随时可查、可改、可续。这是"框架编排"相比"手写循环"在可观测性上的质的飞跃。
 
 ---
 
-## 五、human-in-the-loop interrupt（重点）
+## 五、interrupt 人机交互（重点）
 
 ### 5.1 为什么需要 interrupt
 
@@ -281,7 +462,7 @@ Agent 自主性越高，越要在"危险操作"前插一道人工闸门。典型
 - 发邮件、发短信、付款——对外有副作用，发错了收不回
 - 调用花钱的 API（如付费模型、云函数）——成本敏感，要人点头
 
-Week 03 手写循环要实现"执行前问人"，得自己写 `input()` 阻塞、自己处理恢复——既没法跨重启，也没法服务化（FastAPI 里不能 `input()` 阻塞）。LangGraph 的 `interrupt` 把这件事做成了引擎级能力：**节点内调用 `interrupt()`，图执行暂停，状态留在检查点；人确认后用 `Command(resume=...)` 恢复，图从中断处继续。**
+Week 03 手写循环要实现"执行前问人"，得自己写 `input()` 阻塞、自己处理恢复——既没法跨重启，也没法服务化（FastAPI 里不能 `input()` 阻塞）。LangGraph 的 `interrupt` 把这件事做成了引擎级能力：**节点或 tool 内调用 `interrupt()`，图执行暂停，状态留在检查点；人确认后用 `Command(resume=...)` 恢复，图从中断处继续。**
 
 ### 5.2 interrupt + Command 的执行模型
 
@@ -301,7 +482,7 @@ Week 03 手写循环要实现"执行前问人"，得自己写 `input()` 阻塞�
                           │                            │
                           └────────────┬───────────────┘
                                        ▼
-                  app.invoke(Command(resume="yes"), config)
+                  agent.invoke(Command(resume="yes"), config)
                                        │
                                        ▼
                   interrupt() 返回 "yes"，node_b 继续往下执行
@@ -310,100 +491,148 @@ Week 03 手写循环要实现"执行前问人"，得自己写 `input()` 阻塞�
                                    [node_c] ──► END
 ```
 
-### 5.3 完整示例：删除路线前要人确认
+### 5.3 完整示例：发送邮件前 interrupt 等人确认
 
-这是今天的核心产出 `persistent_agent.py` 的重点片段——一个"删除路线前要人确认"的完整闭环：
+这是今天的核心产出 `persistent_agent.py` 的重点片段：
 
 ```python
-"""persistent_agent.py — Checkpointer 持久化 + interrupt 人机交互"""
+"""persistent_agent.py — Checkpointer + Store + interrupt 完整示例"""
 from typing import Annotated, TypedDict
-from langgraph.checkpoint.sqlite import SqliteSaver   # 用 SQLite 做真持久化
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langchain.agents import create_agent, tool
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
 from langgraph.types import interrupt, Command
 
 
-class RouteState(TypedDict):
-    messages: Annotated[list, add_messages]
-    route_to_delete: str          # 待删除的路线 id（覆盖式）
-    deletion_result: str          # 删除结果（覆盖式）
+# ─── 工具定义 ───
 
+@tool
+def send_confirmation_email(runtime, recipient: str, subject: str, body: str) -> str:
+    """
+    发送确认邮件。危险操作——发送前需人工确认。
 
-# 模拟的路线数据库
-ROUTES_DB = {"route_001": "四姑娘山大峰", "route_002": "贡嘎大环线"}
+    流程：interrupt(payload) 暂停 → 外部确认 → Command(resume=...) 恢复
+    """
+    # 1. 拼出要展示的 payload
+    payload = {
+        "action": "send_email",
+        "recipient": recipient,
+        "subject": subject,
+        "body_preview": body[:100],
+        "question": f"确认向 {recipient} 发送邮件「{subject}」？",
+    }
 
+    # 2. interrupt：图暂停，payload 返回给调用方
+    #    恢复时 Command(resume=...) 的值作为 interrupt() 的返回值
+    approval = interrupt(payload)
 
-def parse_intent_node(state: RouteState) -> dict:
-    """解析用户意图：从消息里提取要删的路线 id。"""
-    last = state["messages"][-1].content
-    # 简化：假设用户消息里直接含 route_xxx
-    route_id = "route_001" if "大峰" in last else "route_002" if "贡嘎" in last else "route_001"
-    return {"route_to_delete": route_id}
-
-
-def delete_route_node(state: RouteState) -> dict:
-    """删除路线节点：危险操作前用 interrupt 要人确认。"""
-    route_id = state["route_to_delete"]
-
-    # ✅ interrupt：图在这里暂停，把问题抛给调用方
-    # 返回值是后续 Command(resume=...) 传入的内容
-    approval = interrupt({
-        "question": f"确认删除路线 {route_id}（{ROUTES_DB.get(route_id, '未知')}）？此操作不可逆！",
-        "route_id": route_id,
-    })
-
+    # 3. 根据确认结果执行或取消
     if approval == "yes":
-        name = ROUTES_DB.pop(route_id, None)
-        result = f"已删除路线 {route_id}（{name}）"
+        # 这里调真实邮件服务
+        return f"邮件已发送至 {recipient}，主题：{subject}"
     else:
-        result = f"已取消删除路线 {route_id}"
-    return {"deletion_result": result}
+        return f"已取消发送邮件至 {recipient}"
 
 
-def report_node(state: RouteState) -> dict:
-    """汇报节点：把删除结果告诉用户。"""
-    return {"messages": [{"role": "assistant", "content": state["deletion_result"]}]}
+@tool
+def get_user_email(runtime) -> str:
+    """获取当前用户的邮箱地址。"""
+    # 从 store 读取用户信息
+    user_id = runtime.config.get("configurable", {}).get("user_id", "anonymous")
+    item = runtime.store.get(("users",), user_id)
+    if item and "email" in item.value:
+        return item.value["email"]
+    return "user@example.com"
 
 
-# 建图：START → 解析意图 → 删除(含 interrupt) → 汇报 → END
-graph = StateGraph(RouteState)
-graph.add_node("parse_intent", parse_intent_node)
-graph.add_node("delete_route", delete_route_node)
-graph.add_node("report", report_node)
-graph.add_edge(START, "parse_intent")
-graph.add_edge("parse_intent", "delete_route")
-graph.add_edge("delete_route", "report")
-graph.add_edge("report", END)
+# ─── 构建 Agent ───
 
-# 用 SqliteSaver 做真持久化（重启不丢）
-checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
-app = graph.compile(checkpointer=checkpointer)
+model = init_chat_model("gpt-4o-mini", temperature=0)
+agent = create_agent(
+    model,
+    tools=[send_confirmation_email, get_user_email],
+    checkpointer=InMemorySaver(),
+    store=InMemoryStore(),
+)
 
-config = {"configurable": {"thread_id": "delete-001"}}
 
-# 第一次 invoke：会停在 delete_route 节点的 interrupt 处
-result = app.invoke(
-    {"messages": [{"role": "user", "content": "帮我删掉贡嘎大环线"}]},
+# ─── 主流程：发邮件前 interrupt 等人确认 ───
+
+config = {"configurable": {"thread_id": "email-001", "user_id": "user_123"}}
+
+# 第一步：用户要求发邮件，Agent 调用 send_confirmation_email 触发 interrupt
+try:
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "给 alice@example.com 发一封邮件，主题是周末徒步计划"}]},
+        config=config,
+    )
+except Exception:
+    # interrupt 导致 invoke 返回时可能以特殊形式退出
+    pass
+
+# 检查是否中断
+snapshot = agent.get_state(config)
+print("next:", snapshot.next)            # ('tools',) — 说明卡在 tools 节点
+print("interrupted:", hasattr(snapshot, "interrupted") and snapshot.interrupted)
+
+# 第二步：查看线程内挂起的 interrupt 负载
+# 2026 年新版 stream_events 提供 stream.interrupts 读取 pending 中断
+# 在 invoke 模式下，通过检查 state 来确认是否中断
+
+# 第三步：人工确认，用 Command(resume=...) 恢复
+result = agent.invoke(
+    Command(resume="yes"),    # ← 关键：value "yes" 成为 interrupt() 的返回值
     config=config,
 )
-# 此时图被 interrupt 暂停，result 是暂停时的状态
-# 检查 next，确认卡在 delete_route
-print("当前 next:", app.get_state(config).next)   # ('delete_route',)
-
-# 人工确认：用 Command(resume=...) 恢复执行
-result = app.invoke(Command(resume="yes"), config=config)
-print(result["messages"][-1]["content"])   # 已删除路线 route_002（贡嘎大环线）
+print(result["messages"][-1].content)   # 邮件已发送至 alice@example.com，...
 ```
 
-### 5.4 interrupt 的三段式用法
+### 5.4 stream_events 模式下的 interrupt 处理
 
-把上面的流程抽象成通用模式，所有"危险操作要人确认"都套这个模板：
+2026 年新版推荐使用 `stream_events` 来处理 interrupt，它提供了更友好的属性访问：
+
+```python
+"""stream_events 模式下的 interrupt 处理"""
+# 使用 stream_events 启动执行
+stream = agent.stream_events(
+    {"messages": [{"role": "user", "content": "给 bob@example.com 发邮件"}]},
+    config,
+    version="v3",           # 2026 年推荐版本
+)
+
+# 检查是否中断
+if stream.interrupted:
+    print("Agent 执行被中断")
+    # 读取所有 pending 的 interrupt 负载
+    for interrupt_payload in stream.interrupts:
+        print("中断原因:", interrupt_payload)
+    
+    # stream.output 包含中断时的最终状态
+    print("中断时状态:", stream.output)
+
+# 恢复中断：传 Command(resume=...)
+stream = agent.stream_events(
+    Command(resume=True),    # resume=True 表示确认
+    config,
+    version="v3",
+)
+```
+
+| stream_events 属性 | 类型 | 说明 |
+|-------------------|------|------|
+| `stream.output` | dict | 最终状态（中断或完成时） |
+| `stream.interrupted` | bool | 是否被 interrupt 暂停 |
+| `stream.interrupts` | list | 所有 pending 的 interrupt payload 列表 |
+| `stream.messages` | list | LLM 消息流 |
+
+### 5.5 interrupt 的三段式用法模板
 
 | 阶段 | 代码 | 发生了什么 |
 |------|------|-----------|
-| ① 中断 | `approval = interrupt({...})` | 图暂停，状态存档，`invoke` 返回，`next` 指向当前节点 |
-| ② 确认 | 人工看 `get_state`，决定 yes/no | 人检查要删的东西对不对 |
-| ③ 恢复 | `app.invoke(Command(resume="yes"), config)` | `interrupt()` 返回 `"yes"`，节点继续执行 |
+| ① 中断 | `approval = interrupt(payload)` | 图暂停，状态存档，`invoke` 返回，`next` 指向当前节点 |
+| ② 确认 | 人工看 `get_state` 或 `stream.interrupts`，决定 yes/no | 人检查要执行的操作对不对 |
+| ③ 恢复 | `agent.invoke(Command(resume="yes"), config)` | `interrupt()` 返回 `"yes"`，节点继续执行 |
 
 > **关键认知：** `interrupt` 和 Week 03 手写 `input()` 的本质区别——`input()` 阻塞的是进程线程，没法跨重启、没法服务化；`interrupt` 暂停的是**图的执行**，状态留在检查点里，可以跨重启、跨进程恢复。这就是为什么说"人机交互是手写 Agent 永远做不到的"——它依赖引擎对执行状态的掌控。
 
@@ -411,17 +640,58 @@ print(result["messages"][-1]["content"])   # 已删除路线 route_002（贡嘎�
 
 ## 六、动手实验
 
-### 🟢 青铜级：MemorySaver 跑通多轮记忆
+### 🟢 青铜级：InMemorySaver 跑通多轮记忆
 
-用 `MemorySaver` 编译一个单节点 chat 图，用同一个 `thread_id` 连续 `invoke` 三轮（第一轮"我叫小明"，第二轮"我叫什么"，第三轮"换个话题，今天天气如何"）。验证第二轮模型能答出"小明"，证明历史被自动保留。然后换个 `thread_id` 再问"我叫什么"，验证模型答不出——证明会话隔离生效。
+用 `create_agent` 创建一个带 `InMemorySaver` 的 Agent（无 tools），用同一个 `thread_id` 连续 invoke 三轮：
+1. 第一轮："你好，我叫小明"
+2. 第二轮："我叫什么名字？"（验证模型能答出"小明"）
+3. 换一个 thread_id 再问"我叫什么名字？"（验证新会话答不出）
 
-### 🟡 白银级：get_state + update_state 人工干预
+**验证点：** 第二轮答出"小明"证明状态被自动存档和恢复；第三轮答不出证明 thread_id 隔离生效。
 
-接青铜级的图。在第二轮 `invoke` 之后，用 `app.get_state(config)` 打印 `values` 和 `next`；接着用 `app.update_state(config, values={"messages": [HumanMessage(content="忽略上面，其实我叫小红")]})` 手动改状态，再用 `app.invoke(None, config=config)` 续跑，验证模型改口叫"小红"。理解"改状态再续跑"这条人工干预路径。
+```bash
+python -c "
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langgraph.checkpoint.memory import InMemorySaver
 
-### 🔴 王者级：SqliteSaver + interrupt 跨重启恢复
+model = init_chat_model('gpt-4o-mini', temperature=0)
+agent = create_agent(model, tools=[], checkpointer=InMemorySaver())
 
-把第五节的"删除路线"示例跑通，但分两个进程跑：进程 A `invoke` 到 `interrupt` 暂停后**直接退出进程**（模拟崩溃）；进程 B 重新启动，用同一个 `thread_id` 和同一个 sqlite 文件，先 `get_state` 确认状态还在，再 `invoke(Command(resume="yes"))` 恢复执行。验证：崩溃重启后，图能从中断点继续，路线被正确删除。这就是生产级断点恢复。
+cfg = {'configurable': {'thread_id': 'bronze-test'}}
+agent.invoke({'messages': [{'role': 'user', 'content': '你好，我叫小明'}]}, config=cfg)
+r2 = agent.invoke({'messages': [{'role': 'user', 'content': '我叫什么名字？'}]}, config=cfg)
+print('同一线程:', r2['messages'][-1].content)
+
+cfg2 = {'configurable': {'thread_id': 'bronze-test-2'}}
+r3 = agent.invoke({'messages': [{'role': 'user', 'content': '我叫什么名字？'}]}, config=cfg2)
+print('新线程:', r3['messages'][-1].content)
+"
+```
+
+### 🟡 白银级：Store 跨线程共享用户偏好
+
+实现以下流程：
+1. 创建带 Checkpointer + Store 的 Agent，定义两个 tool：`save_user_preference` 和 `get_user_preference`
+2. 线程 A 保存偏好"中等难度"
+3. 线程 B（不同 thread_id，同一 user_id）调用 `get_user_preference`，验证能读到"中等难度"
+4. 线程 C（不同 user_id）调用 `get_user_preference`，验证返回"未设置"（不同用户隔离）
+
+**验证点：** 理解 Store 的"跨 thread 共享 + 按 user_id 隔离"的设计——数据是全局的，但需要通过 key 做业务隔离。
+
+### 🔴 王者级：完整持久化应用 + 中断恢复
+
+综合今天全部知识点，完成一个完整的持久化 Agent：
+
+1. **Store 层：** 初始化时给默认用户灌入两条路线偏好（"四姑娘山大峰"和"贡嘎大环线"）
+2. **Agent 层：** 定义三个 tool：
+   - `list_user_routes(runtime)` — 从 Store 读取用户已保存的路线列表
+   - `delete_route(runtime, route_id: str)` — 删除路线，但 **发送前 interrupt** 等人确认
+   - `save_route(runtime, route_name: str)` — 保存新路线到 Store
+3. **中断恢复：** 请求删除时触发 interrupt，调用方检查 `agent.get_state(config).next` 确认卡在 `delete_route`，然后 `Command(resume="yes")` 恢复
+4. **跨会话验证：** 同一个 user_id 换一个 thread_id，调用 `list_user_routes` 确认路线被删除或新增
+
+**产出文件：** `persistent_agent.py`（参考第五节的完整示例）
 
 ---
 
@@ -431,70 +701,70 @@ print(result["messages"][-1]["content"])   # 已删除路线 route_002（贡嘎�
 
 ```python
 # ❌ 编译时挂了 checkpointer，但 invoke 时没传 config
-app = graph.compile(checkpointer=MemorySaver())
-app.invoke({"messages": [...]})   # 没传 config！
+agent = create_agent(model, tools=[], checkpointer=InMemorySaver())
+agent.invoke({"messages": [...]})   # 没传 config！
 
 # 后果：引擎拿不到 thread_id，要么报错要么状态不存档，多轮记忆失效
 ```
 
 **解决：** 只要用了 checkpointer，每次 `invoke` / `stream` 都必须带 `config={"configurable": {"thread_id": "xxx"}}`。`thread_id` 是存档的主键，没它 checkpointer 不知道存给谁。
 
-### 坑 2：thread_id 用了可变对象或忘了区分会话
+### 坑 2：thread_id 用了固定值，所有用户串会话
 
 ```python
 # ❌ 所有用户共用一个 thread_id，会话全串了
 config = {"configurable": {"thread_id": "default"}}
-app.invoke(user_a 的消息, config=config)
-app.invoke(user_b 的消息, config=config)   # user_b 看到了 user_a 的历史！
+agent.invoke(user_a 的消息, config=config)
+agent.invoke(user_b 的消息, config=config)   # user_b 看到了 user_a 的历史！
 
-# ✅ 每个会话/用户用唯一 thread_id
+# ✅ 每个用户/会话用唯一 thread_id
 config_a = {"configurable": {"thread_id": f"session-{user_a_id}"}}
 config_b = {"configurable": {"thread_id": f"session-{user_b_id}"}}
 ```
 
-**症状：** 用户 A 发现 Agent"知道"了用户 B 的对话内容。十有八九是 thread_id 撞了。建议直接用业务实体 id（如 `session-{session_id}`）拼接，保证全局唯一。
+**症状：** 用户 A 发现 Agent"知道"了用户 B 的对话内容。十有八九是 thread_id 撞了。建议直接拼接业务实体 id（如 `session-{session_id}-{user_id}`），保证全局唯一。
 
 ### 坑 3：interrupt 恢复时又传了新输入
 
 ```python
 # ❌ 恢复时既传了 Command(resume=...) 又传了新 messages
-app.invoke(
+agent.invoke(
     Command(resume="yes"),
     config=config,
     # 还想顺手加一条消息？不行！
 )
 
 # ✅ 恢复时只能传 Command(resume=...)，不能再塞新输入
-app.invoke(Command(resume="yes"), config=config)
+agent.invoke(Command(resume="yes"), config=config)
 ```
 
 **解决：** `interrupt` 恢复和"追加新输入"是两种不同的 `invoke` 语义，不能混。想加新消息就先 `update_state` 改状态，再 `invoke(Command(resume=...))` 恢复。把两件事分开做。
 
-### 坑 4：MemorySaver 上线，重启后用户"失忆"
+### 坑 4：InMemoryStore 上线后重启数据全丢
 
 ```python
-# 开发时用 MemorySaver 图快，没切就上线
-checkpointer = MemorySaver()   # 内存！重启全丢
-app = graph.compile(checkpointer=checkpointer)
+# 开发时用 InMemoryStore 图方便，没切就上线
+store = InMemoryStore()   # 内存！重启全丢
+agent = create_agent(model, tools=tools, checkpointer=..., store=store)
 
-# 上线后每次服务器重启，所有用户的对话历史清零，投诉雪崩
+# 上线后每次服务器重启，所有用户的偏好清零
 ```
 
-**解决：** 上线前必须换成持久化实现（`SqliteSaver` / `PostgresSaver`）。切换只改一行 checkpointer 实例，业务代码零改动。养成习惯：**开发用 Memory，上线前 grep 一遍 `MemorySaver` 确认都换掉了。**
+**解决：** `InMemoryStore` 和 `InMemorySaver` 一样，仅供开发调试。上线前必须换成持久化 Store 实现（如基于 Redis 或 SQLite 的 Store 后端）。切换只改一行 store 实例化代码，业务零改动。养成习惯：**开发用 InMemory，上线前 grep 一遍 `InMemoryStore` 确认都换掉了。**
 
-### 坑 5：update_state 改了状态却没续跑
+### 坑 5：`InMemorySaver` 和 `MemorySaver` 混用导致 ImportError
 
 ```python
-# ❌ 以为 update_state 改完就自动往下跑了
-app.update_state(config, values={"category": "技术"})
-# 然后等半天没反应——图不会自己往下走
+# ❌ 旧版路径（2025 年），2026 年已废弃
+from langgraph.checkpoint.memory import MemorySaver   # ImportError!
 
-# ✅ update_state 只改状态，要续跑得显式 invoke(None, config)
-app.update_state(config, values={"category": "技术"})
-result = app.invoke(None, config=config)   # 传 None = 接着跑
+# ✅ 2026 年最新路径
+from langgraph.checkpoint.memory import InMemorySaver
+
+# 如果从旧项目迁移，全局替换 MemorySaver → InMemorySaver
 ```
 
-**解决：** `update_state` 是"改状态"，`invoke` 才是"驱动执行"。改完状态必须显式 `invoke(None, config=config)` 才会从新状态继续。把"改"和"跑"分开记，就不会漏。
+**解决：** 2026 年官网确认 `MemorySaver` 已更名为 `InMemorySaver`。如果看到 `ModuleNotFoundError: No module named 'langgraph.checkpoint.memory.MemorySaver'`，检查 import 路径是否正确。同样的情况也适用于 `uuid7`——新位置是 `from langchain_core.utils.uuid import uuid7`。
 
 ---
 
@@ -502,16 +772,16 @@ result = app.invoke(None, config=config)   # 传 None = 接着跑
 
 ### 8.1 Agent 卡住不动，先看 next 字段
 
-今天最容易遇到的故障是"图跑着跑着不动了"——既没报错也没返回，或者 `invoke` 返回了但结果不对。这种"卡住"的排查，手写 Agent 时代只能靠在循环体里塞 `print` 猜，而 LangGraph 给了你一个直球入口：`app.get_state(config).next`。
+今天最容易遇到的故障是"图跑着跑着不动了"——既没报错也没返回，或者 `invoke` 返回了但结果不对。这种"卡住"的排查，手写 Agent 时代只能靠在循环体里塞 `print` 猜，而 LangGraph 给了你一个直球入口：`agent.get_state(config).next`。
 
 ```python
 # Agent 卡住了？第一步永远是看 next
-snapshot = app.get_state(config)
+snapshot = agent.get_state(config)
 print("next:", snapshot.next)        # 卡在哪个节点
 print("values:", snapshot.values)    # 当前状态长啥样
 ```
 
-`next` 的值直接告诉你卡在哪：是停在某个节点前待执行，还是已经结束（空元组），还是被 `interrupt` 挂起了。这一个字段就能省掉大半的"通读代码脑补控制流"时间。
+`next` 的值直接告诉你卡在哪：是停在某个节点前待执行，还是已经结束（空元组），还是被 `interrupt` 挂起。这一个字段就能省掉大半的"通读代码脑补控制流"时间。
 
 ### 8.2 让 Claude Code 帮你分析状态快照
 
@@ -520,14 +790,14 @@ print("values:", snapshot.values)    # 当前状态长啥样
 ```
 你（对 Claude Code 说）：
   我的 LangGraph Agent 卡住了，这是 get_state 的输出：
-  next: ('delete_route',)
+  next: ('tools',)
   values: {
     "messages": [...12 条...],
     "route_to_delete": "",          # ← 注意这里是空字符串
     "deletion_result": ""
   }
   delete_route 节点里我用了 state["route_to_delete"]，
-  但它执行时报 KeyError 之外的异常。帮我分析状态哪里不对。
+  但它是空字符串。帮我分析状态哪里不对。
 
 Claude Code（分析后）：
   问题在 route_to_delete 是空字符串。
@@ -538,7 +808,7 @@ Claude Code（分析后）：
   建议：检查 parse_intent 的 return 字典的 key 是不是 "route_to_delete"。
 ```
 
-Claude Code 擅长这种"对着状态快照做差异分析"——它能把 `values` 里的字段值和你的预期一一对照，找出哪个字段异常、哪个字段缺失，比人眼扫快得多。
+Claude Code 擅长这种**对着状态快照做差异分析**——它能把 `values` 里的字段值和你的预期一一对照，找出哪个字段异常、哪个字段缺失，比人眼扫快得多。
 
 ### 8.3 配合 LangSmith trace 看全链路
 
@@ -553,20 +823,18 @@ Claude Code 擅长这种"对着状态快照做差异分析"——它能把 `valu
 开启 LangSmith 只需设环境变量：
 
 ```bash
-export LANGSMITH_TRACING=true
-export LANGSMITH_API_KEY=your_key
-# 之后所有 app.invoke 自动上报 trace，去 LangSmith 网页看
+set LANGSMITH_TRACING=true
+set LANGSMITH_API_KEY=your_key
+# 之后所有 agent.invoke 自动上报 trace，去 LangSmith 网页看
 ```
 
 ### 8.4 一套调试断点恢复的标准流程
-
-把今天的副线凝结成一个可复用的排查流程：
 
 ```
 Agent 卡住 / 行为异常
         │
         ▼
-① app.get_state(config).next   ← 定位卡在哪个节点
+① agent.get_state(config).next   ← 定位卡在哪个节点
         │
         ├── next 非空且是预期节点 → 检查该节点逻辑 / 是否 interrupt 挂起
         ├── next 为空但结果不对   → 看 values 里哪个字段异常
@@ -588,13 +856,13 @@ Agent 卡住 / 行为异常
 
 ## 今日产出检查清单
 
-- [ ] 能说清 Checkpointer 的存档机制（每节点后自动存快照），区分 `MemorySaver`（内存/重启丢）与 `SqliteSaver`（SQLite/持久）的适用场景
-- [ ] 能默写 `compile(checkpointer=...)` + `config={"configurable": {"thread_id": ...}}` 标准用法，并解释 `thread_id` 作为会话主键的作用
-- [ ] 用同一 `thread_id` 多次 `invoke` 跑通多轮对话记忆，对比 Week 03 手动维护 messages，说清"状态存档 = 记忆"
-- [ ] 用 `get_state` 查看 `values` / `next`，用 `update_state` 手动改状态后 `invoke(None)` 续跑，跑通人工干预闭环
-- [ ] `persistent_agent.py` 跑通"删除路线前要人确认"完整示例：`interrupt` 中断 → `get_state` 确认 → `Command(resume=...)` 恢复
-- [ ] 能用 `get_state().next` + Claude Code 状态分析 + LangSmith trace 三件套定位"Agent 卡在哪"，复述断点恢复标准流程
+- [ ] 能说清楚 LangGraph 持久化的两个层次（Checkpointer 短时/会话级 vs Store 长期/跨会话级），默写对比表（作用域/生命周期/访问方式/使用场景）
+- [ ] 用 `create_agent(..., checkpointer=InMemorySaver())` + `config={"configurable": {"thread_id": "xxx"}}` 跑通多轮对话记忆，对比 Week 03 手动维护 messages 列表，理解"状态存档 = 记忆"
+- [ ] 用 `InMemoryStore` 创建 Store，在 tool 内通过 `runtime.store.get/put` 读写跨会话持久数据，验证同一 store 下不同 thread 共享用户偏好
+- [ ] 用 `agent.get_state(config)` 查看 `values` / `next`，用 `agent.update_state(config, values)` 手动改状态后 `agent.invoke(None)` 续跑，跑通人工干预闭环
+- [ ] `persistent_agent.py` 跑通完整示例：Store 存用户路线 → interrupt 确认删除 → Command(resume=...) 恢复 → 跨 thread 验证持久化
+- [ ] 能用 `agent.get_state().next` + Claude Code 状态分析 + LangSmith trace 三件套定位"Agent 卡在哪"，复述断点恢复标准流程
 
 ---
 
-> **下一课预告：Day 06 — 高级模式 + Claude Code 调试状态机**。今天我们让图能存档、能暂停、能恢复，但图本身还是"一条线走到底 + 单个 interrupt"。明天上高级模式：**子图**（把复杂图封装成单个节点复用）、**并行节点**（多条边指向同一节点同时执行）、**stream 流式输出**（边跑边吐 token）。副线正式让 Claude Code 上场——帮你把 Graph 结构可视化出来、定位卡死的节点、分析状态机流转。今天的 `get_state` 调试是热身，明天 Claude Code 才是调试状态机的主力。
+> **下一课预告：Day 06 — 高级模式：stream_events / 子图 / 中间件**。今天我们把图装上了持久化和人机交互，但图的拓扑还是一条线。明天上高级模式：**stream_events 流式输出**（边跑边吐 token 和中间结果）、**子图**（把复杂图封装成单个节点复用）、**中间件**（在节点前后插全局逻辑——日志、鉴权、限流）。同时把 Claude Code 调试进一步深化——让它帮你可视化图结构、分析状态机流转、自动生成调试脚本。

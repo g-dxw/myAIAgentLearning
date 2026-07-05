@@ -97,7 +97,7 @@ LangGraph 用一个 **TypedDict** 把状态结构显式声明出来，所有节�
 
 ```python
 from typing import TypedDict, Annotated
-from langgraph.graph.message import add_messages
+from langgraph.graph import add_messages
 from langgraph.graph import StateGraph, START, END
 
 
@@ -192,7 +192,7 @@ app = graph.compile()
 ```python
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langgraph.graph import add_messages
 
 
 class AgentState(TypedDict):
@@ -202,6 +202,43 @@ class AgentState(TypedDict):
 
 # 需要在节点间传递"分类结果""置信度"这类业务字段时，必须自定义 State
 ```
+
+---
+
+### 2.5 State 也可以用 Pydantic model
+
+除了 `TypedDict`，LangGraph 的 State 也支持 Pydantic v2 的 `BaseModel`。Pydantic model 提供运行时类型校验和默认值，适合对状态正确性要求高的场景：
+
+```python
+from pydantic import BaseModel, Field
+from typing import Annotated
+from langgraph.graph import add_messages
+
+
+class PydanticState(BaseModel):
+    messages: Annotated[list, add_messages] = Field(default_factory=list)
+    category: str = ""
+    confidence: float = 0.0
+
+
+def pydantic_node(state: PydanticState) -> dict:
+    last = state.messages[-1]  # Pydantic model 用 . 访问属性
+    return {"category": "技术", "confidence": 0.95}
+
+
+graph = StateGraph(PydanticState)
+```
+
+对比 TypedDict：
+
+| 维度 | TypedDict | Pydantic BaseModel |
+|------|-----------|-------------------|
+| 类型校验 | 仅声明，运行时不检查 | 运行时强制校验 |
+| 默认值 | 需自己处理 | `Field(default=...)` 原生支持 |
+| 属性访问 | `state["key"]` | `state.key` 和 `state["key"]` 都行 |
+| 依赖 | 内置 | 需要 `pydantic` 库 |
+
+**建议：** 快速原型用 TypedDict，生产环境或需要严格类型校验时换 Pydantic。
 
 ---
 
@@ -384,7 +421,7 @@ from typing import TypedDict, Annotated
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langgraph.graph import add_messages
 
 
 # ─── 1. 定义状态 ───
@@ -557,7 +594,7 @@ def node(state):
     return {"messages": [新消息]}   # 直接覆盖！旧消息全没了
 
 # ✅ 必须用 Annotated + add_messages
-from langgraph.graph.message import add_messages
+from langgraph.graph import add_messages
 class GoodState(TypedDict):
     messages: Annotated[list, add_messages]
 ```
@@ -663,6 +700,18 @@ Claude Code 输出：
 
 > **类比记忆：** Week 03 的 while True 是"先写代码再猜控制流"，LangGraph 是"先画图再写代码"。从"代码即控制流"到"图即控制流"，这是从手写 Agent 到框架编排的关键一跃。
 
+### 8.5 了解即可：更高层的 create_agent API
+
+学完今天的 `StateGraph` 基础后，顺便了解一下——LangChain 还提供了一个高层 API `create_agent`（位于 `langchain.agents`）：
+
+```python
+from langchain.agents import create_agent
+
+agent = create_agent(model="gpt-4o-mini", tools=[search_tool, weather_tool])
+```
+
+`create_agent` 内部也是用 `StateGraph` 搭建 agent↔tools 循环图，但自动做了更多配置——包括 prompt 管理、工具绑定、检查点、中间件等。Day 04 我们通过学习手写图来理解它的底层原理，然后用 `create_agent` 做对比。现阶段先知道有这个东西，Day 04 会展开对比。
+
 ---
 
 ## 今日产出检查清单
@@ -676,4 +725,4 @@ Claude Code 输出：
 
 ---
 
-> **下一课预告：Day 04 — LangGraph 进阶：条件边 / 循环 / create_react_agent**。今天我们只学了固定的线性边（A 完了去 B）。明天加上**条件边**（`add_conditional_edges`，根据 state 动态选下一条边），就能实现真正的 ReAct Agent 循环——LLLM 决定调工具就走工具节点，决定回答就走 END。最后用 `create_react_agent` 一行起手，对比手写图的差别。今天画的"分类→三分支"草图，明天亲手把它实现出来。
+> **下一课预告：Day 04 — LangGraph 进阶：手写 StateGraph vs create_agent**。今天我们只学了固定的线性边（A 完了去 B）。明天加上**条件边**（`add_conditional_edges`，根据 state 动态选下一条边），就能实现真正的 ReAct Agent 循环——LLM 决定调工具就走工具节点，决定回答就走 END。最后用 `create_agent` 一行起手，对比手写图的差别。今天画的"分类→三分支"草图，明天亲手把它实现出来。

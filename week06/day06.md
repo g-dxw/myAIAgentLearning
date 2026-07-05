@@ -1,546 +1,775 @@
-# Day 06 — 高级模式 + Claude Code 调试状态机
+# Day 06 — 高级模式：stream_events / 子图 / 中间件
 
 ## 学习目标
 
-Day 03-05 我们把 Agent 从 Week 03 的 `while True` 手写循环，升级成了 LangGraph 的"节点 + 边"显式图，并加上了 Checkpointer 持久化和 `interrupt()` 人机交互。到此单个 Agent 已经能跑了，但真实业务里图的规模会膨胀：检索要查多个数据源、回复要逐 token 流给前端、子流程要能复用。今天讲 LangGraph 的三件高级武器——**子图（Subgraph）、并行节点（Parallel）、流式输出（stream）**，把图从"能跑"推向"能上生产"。副线迎来本周高潮：用 Claude Code 可视化 Graph 结构、定位卡死的节点，把"可观测性"真正用起来。
+Day 03-05 我们从手写 StateGraph 到 create_agent 高层 API，再给 Agent 装上了 Checkpointer 持久化和 interrupt 人机交互。现在单个 Agent 已经能跑、能存、能等人确认，但真实生产还有三个硬需求没解决：**前端要逐 token 打字机效果**（不能等整张图跑完才给用户看）、**多 Agent 系统要把专家 Agent 当"零件"嵌入主流程**（复用而非重写）、**生产要兜底重试和 PII 过滤**（不能裸奔上线）。今天讲的 stream_events / 子图 / 中间件，就是 LangGraph 给这三个需求的原生答案。副线用 Claude Code"调试三件套"配合流式分析，把图从"能跑"推向"可观测"。
 
 学完今天你能：
-1. 把一个复杂图拆成多个子图，让子图作为节点嵌入主图，实现 State 隔离与流程复用
-2. 用 `add_edge(START, "a")` + `add_edge(START, "b")` 做 fan-out/fan-in 并行，并用 `asyncio` 并发检索多个数据源
-3. 区分 `stream_mode` 四种模式（values / updates / messages / debug），写出 `astream` 逐 token 流式，呼应 Week 02 的 SSE
-4. 用"调试三件套"（`get_state` / `draw_mermaid` / LangSmith trace）配合 Claude Code 定位 Agent 卡死、状态丢失等典型 bug
+
+1. 用 `agent.stream_events(version="v3")` 消费逐 token 消息流、节点级状态快照、中断事件，实现前端打字机效果
+2. 把 `create_agent` 创建的 Agent 作为子图节点嵌入主图，实现多 Agent 系统中"专家 Agent 即插即用"
+3. 在 `create_agent` 中配置 Middleware 插件（模型重试、工具重试、PII 过滤），理解 2026 年新引入的插件体系
+4. 用 `agent.get_graph().draw_mermaid_png()` 可视化图结构，结合 Claude Code 定位流式异常
 
 ---
 
-## 一、子图 Subgraph：把复杂图拆开
+## 一、stream_events 事件流（重点）
 
-### 1.1 为什么需要子图
+### 1.1 为什么需要事件流
 
-随着业务变复杂，一张图里可能塞了十几个节点：检索、重排、起草、校对、翻译……全堆在一张图里，既难维护也难复用。子图的思路很朴素：**把一段相对独立的子流程，单独编译成一张图，再作为一个节点嵌入主图。**
+LangGraph 的图引擎在执行过程中会产生各种粒度的"事件"——LLM 的逐 token 输出、每个节点执行后的状态快照、interrupt 中断信息。过去 LangGraph 用 `stream_mode="messages"` / `"values"` 等分散 API 来消费这些事件，不同模式之间切换复杂。**`stream_events(version="v3")` 是 LangGraph 在 2026 年推出的统一事件流 API**，用一个入口消费所有粒度的流式数据。
 
-```
-主图（主编排）              子图（研究子流程）
-┌────────────────────┐     ┌──────────────────────┐
-│  START → research  │ ──► │ planner → searcher   │
-│        → draft     │     │        → summarizer  │
-│        → END       │     └──────────────────────┘
-└────────────────────┘           ↑ 作为节点整体嵌入
-```
+| 场景 | 旧 API | 新 API（推荐） |
+|------|--------|----------------|
+| 逐 token 打字机 | `astream(stream_mode="messages")` | `stream_events(version="v3").messages` |
+| 节点级状态快照 | `astream(stream_mode="values")` | `stream_events(version="v3").values` |
+| 中断事件 | 查 `get_state().next` 推断 | `stream_events(version="v3").interrupts` |
+| 最终输出 | `invoke` 返回值 | `stream_events(version="v3").output` |
 
-子图有两个关键特性：
+### 1.2 stream_events v3 的 typed projections
 
-| 特性 | 说明 | 价值 |
-|------|------|------|
-| 独立 State | 子图有自己的状态结构，主图和子图状态互不污染 | 团队协作时各管各的字段 |
-| 可复用 | 同一个编译好的子图，能在多个主图里 `add_node` 嵌入 | 研究子流程给报告 Agent、客服 Agent 共用 |
-| 可单独调试 | 子图本身是一张完整的图，能单独 `invoke` / `stream` | 不用跑通主图就能验证子流程 |
+`stream_events(version="v3")` 返回一个 `StreamSnapshot` 对象，通过以下 typed projections（类型化属性）访问不同粒度的流数据：
 
-### 1.2 子图作为节点嵌入主图
+| 属性 | 类型 | 内容 | 粒度 |
+|------|------|------|------|
+| `.messages` | `list[AIMessageChunk]` | LLM 生成的逐 token 消息 | token 级 |
+| `.values` | `dict` | 每个节点执行后的全状态快照 | 节点级 |
+| `.interrupts` | `list[InterruptEvent]` | 中断信息列表 | 中断级 |
+| `.interrupted` | `bool` | 是否发生了中断 | 中断级 |
+| `.output` | `dict` | 图的最终输出 | 图级 |
 
-LangGraph 的 API 很直接：**一个编译好的图（`CompiledGraph`）本身就可以作为节点传给 `add_node`**。
-
-```python
-"""subgraph_demo.py — 子图：研究子图嵌入主编排图"""
-
-from typing import TypedDict, Annotated
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-
-
-# ─── 1. 子图：研究子流程，独立 State ───
-class ResearchState(TypedDict):
-    """研究子图的内部状态，主图看不到这些字段。"""
-    topic: str                 # 待研究主题
-    findings: Annotated[list,  # 检索到的资料（列表拼接 reducer）
-                        __import__("operator").add]
-
-
-def planner_node(state: ResearchState) -> dict:
-    """规划节点：把主题拆成检索词。"""
-    keywords = [w for w in state["topic"].split() if w]
-    return {"findings": [f"检索词: {k}" for k in keywords]}
-
-
-def searcher_node(state: ResearchState) -> dict:
-    """检索节点：模拟去知识库检索。"""
-    return {"findings": [f"关于「{state['topic']}」的检索结果片段"]}
-
-
-def summarizer_node(state: ResearchState) -> dict:
-    """总结节点：把检索结果汇总成研究摘要。"""
-    summary = "；".join(state["findings"])
-    return {"findings": [f"研究摘要: {summary}"]}
-
-
-# 子图编译：planner → searcher → summarizer
-research_builder = StateGraph(ResearchState)
-research_builder.add_node("planner", planner_node)
-research_builder.add_node("searcher", searcher_node)
-research_builder.add_node("summarizer", summarizer_node)
-research_builder.add_edge(START, "planner")
-research_builder.add_edge("planner", "searcher")
-research_builder.add_edge("searcher", "summarizer")
-research_builder.add_edge("summarizer", END)
-research_app = research_builder.compile()   # 编译好的子图
-
-
-# ─── 2. 主图：主编排，把子图当节点嵌入 ───
-class MainState(TypedDict):
-    """主图状态：只关心 topic 和 final_report。"""
-    topic: str
-    final_report: str
-
-
-def route_node(state: MainState) -> dict:
-    """主图入口节点：初始化主题。"""
-    return {}   # 占位，topic 由调用方传入
-
-
-def draft_node(state: MainState) -> dict:
-    """起草节点：基于子图产出的研究摘要起草报告。"""
-    return {"final_report": f"基于「{state['topic']}」起草的最终报告"}
-
-
-# 关键：把编译好的子图 research_app 作为一个节点加入主图
-main_builder = StateGraph(MainState)
-main_builder.add_node("route", route_node)
-main_builder.add_node("research", research_app)   # ← 子图作为节点
-main_builder.add_node("draft", draft_node)
-main_builder.add_edge(START, "route")
-main_builder.add_edge("route", "research")
-main_builder.add_edge("research", "draft")
-main_builder.add_edge("draft", END)
-
-main_app = main_builder.compile()
-
-# 调用：主图 invoke，子图在内部自动跑完整套流程
-result = main_app.invoke({"topic": "LangGraph 子图机制"})
-print(result["final_report"])
-```
-
-> **关键点：** 主图的 `MainState` 里没有 `findings` 字段，子图的 `ResearchState` 里没有 `final_report` 字段——两者 State 隔离。子图跑完后，主图只能拿到子图"对外暴露"的那部分（通过 State 字段名对齐传递）。这让团队协作时"研究组"和"报告组"各管各的状态，互不干扰。
-
----
-
-## 二、并行节点：fan-out / fan-in
-
-### 2.1 同一源连多个目标就是并行
-
-LangGraph 里实现并行非常简单：**从同一个源节点连多条边到不同目标，这些目标就会并行执行**，全部完成后才会汇合到下一个节点。
+遍历方式是 for 循环逐帧消费，每帧是一个 `StreamSnapshot`，包含上面的属性：
 
 ```python
-from langgraph.graph import StateGraph, START, END
-
-# fan-out：START 同时连到 search_web / search_kb / search_cache
-graph.add_edge(START, "search_web")     # ┐
-graph.add_edge(START, "search_kb")      # ├─ 三路并行
-graph.add_edge(START, "search_cache")   # ┘
-
-# fan-in：三路都汇合到 merge 节点
-graph.add_edge("search_web", "merge")
-graph.add_edge("search_kb", "merge")
-graph.add_edge("search_cache", "merge")
-graph.add_edge("merge", END)
+stream = app.stream_events(input, config, version="v3")
+for snapshot in stream:
+    # 每一帧 snapshot 包含当前节点的产出
+    if snapshot.messages:
+        for msg in snapshot.messages:
+            print(msg.content, end="", flush=True)   # 逐 token 打字机
+    if snapshot.values:
+        print("状态更新:", snapshot.values)           # 节点级快照
+    if snapshot.interrupted:
+        print("发生中断:", snapshot.interrupts)       # 中断事件
 ```
 
-对应的图结构：
-
-```mermaid
-graph LR
-    START([START]) --> web[search_web]
-    START --> kb[search_kb]
-    START --> cache[search_cache]
-    web --> merge[merge 合并]
-    kb --> merge
-    cache --> merge
-    merge --> END([END])
-```
-
-### 2.2 并行检索多个数据源
-
-真实场景：一个查询要同时查 Web、知识库、缓存，谁先回来谁先填，全部到齐再合并。这正是 Week 04/05 向量库检索的"多路召回"升级版——从串行变成并行。
+### 1.3 完整示例：消费所有事件类型
 
 ```python
-"""parallel_search.py — 并行检索多数据源（fan-out / fan-in）"""
+"""stream_events_demo.py — 用 stream_events v3 消费所有事件类型
 
-import asyncio
-from typing import TypedDict, Annotated
-import operator
-from langgraph.graph import StateGraph, START, END
+演示内容：
+1. create_agent 创建标准 ReAct Agent
+2. 用 stream_events(version="v3") 消费 messages / values / interrupts
+3. 在前端风格的循环中分别处理打字机文本、状态更新、中断信息
+"""
 
-
-class SearchState(TypedDict):
-    query: str
-    # results 用 operator.add reducer：多路并行结果自动拼接成一个列表
-    results: Annotated[list[str], operator.add]
-
-
-async def search_web(state: SearchState) -> dict:
-    """模拟异步查 Web（耗时 0.3s）。"""
-    await asyncio.sleep(0.3)
-    return {"results": [f"[Web] {state['query']} 的网页结果"]}
-
-
-async def search_kb(state: SearchState) -> dict:
-    """模拟异步查知识库（耗时 0.2s）。"""
-    await asyncio.sleep(0.2)
-    return {"results": [f"[KB] {state['query']} 的知识库结果"]}
-
-
-async def search_cache(state: SearchState) -> dict:
-    """模拟异步查缓存（耗时 0.1s）。"""
-    await asyncio.sleep(0.1)
-    return {"results": [f"[Cache] {state['query']} 的缓存结果"]}
-
-
-async def merge_node(state: SearchState) -> dict:
-    """合并节点：把多路结果去重排序。"""
-    unique = list(dict.fromkeys(state["results"]))   # 保序去重
-    return {"results": unique}   # 覆盖回去
-
-
-builder = StateGraph(SearchState)
-builder.add_node("search_web", search_web)
-builder.add_node("search_kb", search_kb)
-builder.add_node("search_cache", search_cache)
-builder.add_node("merge", merge_node)
-
-# fan-out：START 同时连三路 → 并行执行
-builder.add_edge(START, "search_web")
-builder.add_edge(START, "search_kb")
-builder.add_edge(START, "search_cache")
-# fan-in：三路汇合到 merge
-builder.add_edge("search_web", "merge")
-builder.add_edge("search_kb", "merge")
-builder.add_edge("search_cache", "merge")
-builder.add_edge("merge", END)
-
-app = builder.compile()
-
-# 异步调用
-result = asyncio.run(app.ainvoke({"query": "LangGraph 并行", "results": []}))
-print(result["results"])
-# 串行需 0.3+0.2+0.1=0.6s，并行只需 max(0.3,0.2,0.1)=0.3s
-```
-
-> **为什么并行省时间？** 串行三路检索总耗时是各路之和（0.6s），并行是各路最大值（0.3s）。这就是 `asyncio` 并发的价值——LangGraph 帮你把 fan-out/fan-in 的调度封装好了，你只管连边。
-
-### 2.3 动态并行：Send API
-
-固定 fan-out（写死三条边）适用于"数据源数量已知"。如果数据源数量运行时才定（比如对列表里每个元素都并行处理），用 `Send` API 做动态 fan-out：
-
-```python
-from langgraph.types import Send
-
-def dispatch(state):
-    # 对每个子任务动态 fan-out，每个 Send 启动一个 worker 副本
-    return [Send("worker", {"task": t}) for t in state["tasks"]]
-```
-
-`Send` 让"并行度由数据决定"成为可能，是 map-reduce 风格任务的标准写法。今天先建立概念，Day 07 综合实战会用到。
-
----
-
-## 三、流式输出 stream（重点）
-
-### 3.1 为什么流式是生产刚需
-
-Week 02 我们手写过 SSE 流式，核心动机是：**用户等不了 10 秒后一次性蹦出一大段文字，他们要"边生成边看到"**。LangGraph 把这件事内建了——`app.stream()` / `app.astream()` 让你能逐节点、甚至逐 token 拿到中间结果，不用等整张图跑完。
-
-### 3.2 stream_mode 四种模式对比
-
-`stream` 和 `astream` 都接受一个 `stream_mode` 参数，决定"流出来的是什么粒度"：
-
-| stream_mode | 流出内容 | 粒度 | 典型用途 |
-|------------|----------|------|----------|
-| `"values"` | 每个节点执行后的**完整状态快照** | 节点级 | 想看每一步后全状态长啥样 |
-| `"updates"` | 每个节点返回的**增量更新**（partial state + 节点名） | 节点级 | 前端按节点显示进度、哪个节点在跑 |
-| `"messages"` | LLM 的**逐 token 输出** | token 级 | 聊天界面打字机效果，呼应 Week 02 SSE |
-| `"debug"` | 含任务调度、节点出入边的**详细执行轨迹** | 最细 | 调试时看清图的每一步调度 |
-
-**选型口诀：** 调试用 `debug`；看全状态用 `values`；前端进度条用 `updates`；聊天打字机用 `messages`。
-
-### 3.3 astream + stream_mode="messages" 逐 token 流式
-
-这是今天最实用的片段——让 LLM 节点的回答逐 token 流出来，前端直接接到 SSE 通道（呼应 Week 02）。
-
-```python
-"""stream_demo.py — astream + stream_mode='messages' 逐 token 流式"""
-
-import asyncio
-from typing import Annotated
+from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
 
 
-class ChatState(TypedDict):
-    messages: Annotated[list, add_messages]
+@tool
+def get_weather(city: str) -> str:
+    """查询指定城市的当前天气。"""
+    # 模拟天气查询
+    data = {"北京": "晴 22°C", "成都": "多云 28°C", "上海": "小雨 19°C"}
+    return data.get(city, f"{city}：气温 20°C，天气未知")
 
 
-model = init_chat_model("gpt-4o-mini", temperature=0.7)
+@tool
+def get_temperature(city: str) -> str:
+    """查询指定城市的当前温度。"""
+    data = {"北京": "22°C", "成都": "28°C", "上海": "19°C"}
+    return data.get(city, "20°C")
 
 
-def llm_node(state: ChatState) -> dict:
-    """LLM 节点：模型本身支持流式，配合 stream_mode='messages' 逐 token 输出。"""
-    response = model.invoke(state["messages"])
-    return {"messages": [response]}
+model = init_chat_model("gpt-4o-mini", temperature=0)
 
+agent = create_agent(
+    model=model,
+    tools=[get_weather, get_temperature],
+    system_prompt="你是天气助手，负责查询天气。",
+    checkpointer=InMemorySaver(),
+)
 
-graph = StateGraph(ChatState)
-graph.add_node("llm", llm_node)
-graph.add_edge(START, "llm")
-graph.add_edge("llm", END)
-app = graph.compile()
+config = {"configurable": {"thread_id": "stream-demo-001"}}
 
+input_data = {
+    "messages": [{"role": "user", "content": "北京今天天气怎么样？温度多少？"}]
+}
 
-async def main():
-    """逐 token 打印 LLM 回复，模拟前端打字机效果。"""
-    async for msg, metadata in app.astream(
-        {"messages": [HumanMessage(content="用三句话介绍 LangGraph 的核心思想")]},
-        stream_mode="messages",
-    ):
-        # msg 是 AIMessageChunk，content 属性是当前 token 的文本片段
-        if msg.content:
-            print(msg.content, end="", flush=True)
-    print()   # 收尾换行
+stream = agent.stream_events(input_data, config, version="v3")
 
+# — 消费所有事件类型 —
+for idx, snapshot in enumerate(stream):
+    print(f"\n=== 帧 {idx + 1} ===")
 
-asyncio.run(main())
+    # 1) messages：逐 token 流式文本
+    if snapshot.messages:
+        for msg in snapshot.messages:
+            if msg.content:
+                print(f"[token]: {msg.content}")
+
+    # 2) values：节点级状态快照
+    if snapshot.values:
+        top_keys = list(snapshot.values.keys())
+        print(f"[state]: keys={top_keys}")
+
+    # 3) interrupts：中断信息
+    if snapshot.interrupted:
+        print(f"[interrupt]: {snapshot.interrupts}")
+
+# 最终输出
+final_output = stream.output
+if final_output:
+    last_msg = final_output["messages"][-1]
+    print(f"\n最终回答: {last_msg.content}")
 ```
 
-> **呼应 Week 02：** Week 02 我们手写 SSE，要把每个 token 包成 `data: {...}\n\n` 推给前端。今天 LangGraph 的 `astream(stream_mode="messages")` 直接给你 token 流，你在 FastAPI 路由里包一层 `StreamingResponse` 就能复用 Week 02 那套 SSE 通道——底层管道没变，只是 token 来源从手写 httpx 换成了 LangGraph。
+### 1.4 stream(version="v2") 与 StreamPart dict
 
-### 3.4 updates 模式：看节点级进度
-
-`stream_mode="updates"` 每个节点跑完就吐一条 `{节点名: partial_state}`，适合做"当前在第几步"的进度展示：
+除了 v3，LangGraph 也保留了 `stream(version="v2")` 作为轻量级流式选择。它返回统一的 `StreamPart` 字典流，每个条目包含 `{type, ns, data}` 三个字段：
 
 ```python
-async for chunk in app.astream(input, stream_mode="updates"):
-    for node_name, partial in chunk.items():
-        print(f"[{node_name}] 完成，更新了: {list(partial.keys())}")
+"""stream_v2_demo.py — stream(version="v2") 返回统一 StreamPart dict"""
+
+# 接续上面的 agent / config / input_data
+for event in agent.stream(input_data, config, version="v2"):
+    # event 是一个 dict: {"type": str, "ns": list[str], "data": dict}
+    if event["type"] == "values":
+        print(f"[values] ns={event['ns']}, data keys={list(event['data'].keys())}")
+    elif event["type"] == "messages":
+        for msg in event["data"].get("messages", []):
+            if hasattr(msg, "content") and msg.content:
+                print(f"[messages] {msg.content}")
+    elif event["type"] == "interrupts":
+        print(f"[interrupts] {event['data']}")
 ```
+
+**v2 与 v3 的选择建议：**
+
+| 维度 | stream(version="v2") | stream_events(version="v3") |
+|------|---------------------|----------------------------|
+| 返回类型 | 原始 StreamPart dict | 类型化的 StreamSnapshot 对象 |
+| 访问方式 | `event["type"]` / `event["data"]` | `snapshot.messages` / `.values` 等属性 |
+| 学习成本 | 低，纯 dict 直白 | 略高，需要了解各个 projection |
+| 类型安全 | 无（手写 key） | 有（IDE 补全友好） |
+| 推荐度 | 快速原型 | 生产代码，可维护性更好 |
+
+### 1.5 在 tool 内用 get_stream_writer 发送自定义事件
+
+当工具函数执行时，有时需要实时发送中间进度（如"正在检索知识库第 3/10 条"）。LangGraph 提供了 `get_stream_writer`，让节点或工具内直接写入自定义流数据：
+
+```python
+"""custom_stream_event.py — 在 tool 内用 get_stream_writer 发自定义事件"""
+
+from langgraph.config import get_stream_writer
+from langchain_core.tools import tool
+
+
+@tool
+def search_knowledge_base(query: str) -> str:
+    """在知识库中搜索，并实时报告搜索进度。"""
+    writer = get_stream_writer()             # ← 获取当前流的 writer
+    chunks = ["结果A", "结果B", "结果C"]
+
+    for i, chunk in enumerate(chunks):
+        # 发送自定义事件，type 为 "custom_progress"
+        writer({"type": "custom_progress", "data": {"progress": f"第 {i+1}/{len(chunks)} 条", "content": chunk}})
+
+    return "；".join(chunks)
+```
+
+在消费端，如果是 `stream(version="v2")`，自定义事件的 `type` 字段就是你在 writer 里指定的值：
+
+```python
+for event in agent.stream(input_data, config, version="v2"):
+    if event["type"] == "custom_progress":
+        print(f"进度: {event['data']['progress']} → {event['data']['content']}")
+```
+
+> **和 Week 02 SSE 的呼应：** Week 02 我们手动把 token 包成 `data: {...}\n\n` 推给前端。今天 LangGraph 的 `stream_events(version="v3")` 通过 `.messages` 属性直接暴露 token 流，你在 FastAPI 路由里包一层 `StreamingResponse` 就能复用 Week 02 的 SSE 通道——底层管道相同，只是 token 来源从手写 httpx 换成了 LangGraph。
 
 ---
 
-## 四、图可视化：draw_mermaid
+## 二、子图 Subgraph：Agent 即插即用
 
-### 4.1 一行代码画图
+### 2.1 什么是子图
 
-LangGraph 内置了把图结构导出成 Mermaid 语法的能力，这是"图即控制流"理念的直接兑现——你的图不仅能跑，还能画。
+当一张图有十几个节点、多个条件分支、并行路径时，全部塞在一个 StateGraph 里既难以维护也无法复用。**子图（Subgraph）的思路是把一段相对独立的子流程编译成一张独立的图，然后作为"一个节点"嵌入主图。**
+
+在 LangGraph 中，**任何编译好的图（`CompiledGraph`）或 `create_agent` 创建的 Agent 都可以直接作为节点加入另一张图**——这就是"子图即节点"的核心思想。
+
+### 2.2 create_agent 作为子图节点
+
+`create_agent` 返回的 Agent 本身是一个 `CompiledGraph`（语言的图），因此可以直接传给主图的 `add_node`：
 
 ```python
-# 一行导出 Mermaid 文本
-print(app.get_graph().draw_mermaid())
+"""subgraph_create_agent.py — 用 create_agent 创建子 Agent 嵌入主图
+
+演示内容：
+1. 创建两个专家 Agent（水果专家 / 蔬菜专家）
+2. 主图根据用户输入路由到对应的专家子图
+3. 子图 Agent 内置工具循环和 Checkpointer，完全独立运行
+"""
+
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from typing import TypedDict
+
+
+# ─── 工具定义 ───
+
+@tool
+def fruit_catalog(query: str) -> str:
+    """查询水果信息。"""
+    data = {"苹果": "苹果是蔷薇科水果，富含维生素C", "香蕉": "香蕉富含钾元素，有助于消化"}
+    return data.get(query, f"未找到水果: {query}")
+
+
+@tool
+def veggie_catalog(query: str) -> str:
+    """查询蔬菜信息。"""
+    data = {"菠菜": "菠菜富含铁和叶酸，是深绿色蔬菜", "胡萝卜": "胡萝卜富含β-胡萝卜素，对视力有益"}
+    return data.get(query, f"未找到蔬菜: {query}")
+
+
+# ─── 子 Agent 1：水果专家 ───
+model = init_chat_model("gpt-4o-mini", temperature=0)
+
+fruit_expert = create_agent(
+    model=model,
+    tools=[fruit_catalog],
+    system_prompt="你是水果专家，只回答水果相关问题。使用 fruit_catalog 工具查询信息。",
+    checkpointer=InMemorySaver(),    # 子图自带检查点
+)
+
+# ─── 子 Agent 2：蔬菜专家 ───
+veggie_expert = create_agent(
+    model=model,
+    tools=[veggie_catalog],
+    system_prompt="你是蔬菜专家，只回答蔬菜相关问题。使用 veggie_catalog 工具查询信息。",
+    checkpointer=InMemorySaver(),
+)
+
+
+# ─── 主图 State ───
+class MainState(TypedDict):
+    """主图状态。专家子图有自己的内部状态，主图不感知。"""
+    input_text: str
+    category: str        # 路由结果："fruit" / "veggie"
+    final_answer: str
+
+
+# ─── 主图节点 ───
+def classify_node(state: MainState) -> dict:
+    """分类节点：判断用户输入是水果还是蔬菜问题。"""
+    text = state["input_text"]
+    # 简单关键词分类（生产环境应使用 LLM 分类）
+    category = "fruit" if any(k in text for k in ["苹果", "香蕉", "水果"]) else "veggie"
+    return {"category": category}
+
+
+def compose_input(state: MainState) -> dict:
+    """封装节点：把主图数据转成子图 Agent 需要的消息格式。"""
+    # 返回 final_answer 占位，子图的输出通过 add_node 返回的 state 合并
+    return {}
+
+
+def final_node(state: MainState) -> dict:
+    """汇总节点：从主图 messages 中提取最终回答。"""
+    return {}
+
+
+# ─── 建主图 ───
+main_builder = StateGraph(MainState)
+
+main_builder.add_node("classifier", classify_node)
+# 关键：把 create_agent 编译好的子图作为节点加入主图
+main_builder.add_node("fruit_expert", fruit_expert)     # ← 子图作为节点
+main_builder.add_node("veggie_expert", veggie_expert)   # ← 子图作为节点
+
+main_builder.add_edge(START, "classifier")
+
+# 条件路由：根据分类选择子图
+def route_to_expert(state: MainState):
+    if state["category"] == "fruit":
+        return "fruit_expert"
+    return "veggie_expert"
+
+main_builder.add_conditional_edges("classifier", route_to_expert)
+main_builder.add_edge("fruit_expert", END)
+main_builder.add_edge("veggie_expert", END)
+
+main_app = main_builder.compile(checkpointer=InMemorySaver())
+
+# ─── 调用 ───
+config = {"configurable": {"thread_id": "subgraph-demo"}}
+result = main_app.invoke(
+    {"input_text": "苹果有什么营养价值？"},
+    config,
+)
+# 子图 Agent 内部自动调用了 fruit_catalog 工具并生成回答
+print("最终回答:", result.get("final_answer", "(查看 last message)"))
 ```
 
-把输出的 Mermaid 文本贴进任何支持 Mermaid 的渲染器（GitHub README、Obsidian、VS Code 插件、Mermaid Live Editor），就能看到图的结构。
+### 2.3 子图的检查点策略
 
-### 4.2 可视化的双重价值
+| 策略 | 行为 | 适用场景 |
+|------|------|----------|
+| **per-invocation**（默认） | 每次子图被调用时，子图内部状态独立存档 | 子图每次调用是独立的"任务会话" |
+| **per-thread** | 子图和主图共享 thread_id 的存档链 | 子图需要感知主图的历史上下文 |
+| **stateless** | 子图不存档，子图内状态不持久化 | 子图是纯计算节点，无状态需求 |
 
-| 价值 | 说明 |
-|------|------|
-| **调试** | 边连错没、节点孤立没、并行/串行对不对，图上一眼看出 |
-| **沟通** | 给产品/同事讲 Agent 流程，一张图胜过千行代码 |
+> **关键认知：** 子图的"独立 State"是 LangGraph 架构设计的精髓——主图的 `MainState` 没有水果/蔬菜专家内部的 `messages` 字段，子图的内部状态对外界完全封装。这让不同团队可以各自维护自己的子图 State 定义，彼此不耦合。
+
+### 2.4 子图的 State 隔离与数据传递
+
+子图运行后，它的内部状态（如 `messages`、工具调用结果）不会污染主图 State。主图拿到的是子图的"最终输出"——即子图 State 中与主图 State 同名字段的合并结果。因此，**如果主图需要拿到子图的产出，需要在主图和子图 State 中定义同名字段**（如 `final_answer`），或通过外层的包装节点做字段映射。
+
+---
+
+## 三、中间件系统（2026 新概念）
+
+### 3.1 什么是 Middleware
+
+**Middleware（中间件）是 LangChain 在 2026 年引入的新插件体系**，它在 Agent 循环的特定执行点注入横切关注点（cross-cutting concerns），让错误重试、敏感信息过滤、人机交互确认等逻辑从业务代码中抽离为可插拔的插件。
+
+为什么要用 Middleware？没有中间件时，重试逻辑得手写在每个工具调用前后：
+
+```python
+# ❌ 没有中间件：重试逻辑分散在业务代码里
+max_retries = 3
+for attempt in range(max_retries):
+    try:
+        result = model.invoke(messages)
+        break
+    except Exception:
+        if attempt == max_retries - 1:
+            raise
+        time.sleep(1)
+```
+
+有了 Middleware，一行配置注入，业务代码零侵入：
+
+```python
+# ✅ 有中间件：重试逻辑由框架接管
+agent = create_agent(model, tools, middleware=[ModelRetryMiddleware(max_retries=3)])
+# 业务代码里完全不需要写重试——中间件自动兜底
+```
+
+### 3.2 预置中间件
+
+LangChain 在 `langchain.agents.middleware` 模块中预置了四个中间件：
+
+| 中间件 | 导入路径 | 作用 | 典型参数 |
+|--------|----------|------|----------|
+| `ModelRetryMiddleware` | `from langchain.agents.middleware import ModelRetryMiddleware` | LLM 调用失败时自动重试 | `max_retries=3`、`retry_delay=1.0` |
+| `ToolRetryMiddleware` | `from langchain.agents.middleware import ToolRetryMiddleware` | 工具调用失败时自动重试 | `max_retries=2`、`retryable_exceptions=(TimeoutError,)` |
+| `PIIMiddleware` | `from langchain.agents.middleware import PIIMiddleware` | 检测并过滤输入/输出中的敏感个人信息 | `pii_types=["EMAIL", "PHONE"]`、`mode="mask"` |
+| `HumanInTheLoopMiddleware` | `from langchain.agents.middleware import HumanInTheLoopMiddleware` | 工具调用前请求人工确认 | `require_confirmation_for=["delete_*", "send_*"]` |
+
+### 3.3 完整示例：带 Middleware 的 Agent
+
+```python
+"""middleware_demo.py — create_agent 配置多个 Middleware
+
+演示内容：
+1. ModelRetryMiddleware：LLM 调用失败自动重试 3 次
+2. ToolRetryMiddleware：工具调用超时自动重试 2 次
+3. PIIMiddleware：过滤输出中的邮箱、手机号
+4. 观察中间件日志输出
+"""
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelRetryMiddleware,
+    ToolRetryMiddleware,
+    PIIMiddleware,
+)
+from langchain.chat_models import init_chat_model
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+@tool
+def get_user_info(user_id: str) -> str:
+    """查询用户信息，可能返回敏感数据。"""
+    data = {
+        "u001": "用户张三，邮箱: zhangsan@example.com，电话: 13800138000",
+        "u002": "用户李四，邮箱: lisi@example.com，电话: 13900139000",
+    }
+    return data.get(user_id, "未找到用户")
+
+
+@tool
+def unstable_api(query: str) -> str:
+    """模拟一个不稳定会超时的 API。"""
+    import random
+    if random.random() < 0.3:
+        raise TimeoutError("API 超时（模拟）")
+    return f"查询结果: {query}"
+
+
+model = init_chat_model("gpt-4o-mini", temperature=0)
+
+agent = create_agent(
+    model=model,
+    tools=[get_user_info, unstable_api],
+    system_prompt="你是用户信息助手。查询用户信息并返回。",
+    checkpointer=InMemorySaver(),
+    middleware=[
+        ModelRetryMiddleware(max_retries=3, retry_delay=0.5),
+        ToolRetryMiddleware(max_retries=2, retryable_exceptions=(TimeoutError,)),
+        PIIMiddleware(pii_types=["EMAIL", "PHONE"], mode="mask"),
+    ],
+)
+
+config = {"configurable": {"thread_id": "middleware-demo"}}
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "查询用户 u001 的信息"}]},
+    config,
+)
+print(result["messages"][-1].content)
+# 预期输出中邮箱和电话被 mask 掉：
+# "用户张三，邮箱: [FILTERED]，电话: [FILTERED]"
+```
+
+### 3.4 Middleware 的执行顺序
+
+多个 Middleware 按列表顺序形成"洋葱模型"——外层中间件先拦截请求、后处理响应：
+
+```
+请求进入 →
+  PIIMiddleware（先过滤输入中的 PII）
+    → ToolRetryMiddleware（为工具调用兜底重试）
+      → ModelRetryMiddleware（为 LLM 调用兜底重试）
+        → Agent 核心循环
+      ← ModelRetryMiddleware（处理 LLM 响应异常）
+    ← ToolRetryMiddleware（处理工具响应异常）
+  ← PIIMiddleware（过滤输出中的 PII）
+→ 响应返回
+```
+
+### 3.5 Middleware 与 Day 05 interrupt 的对比
+
+| 维度 | StateGraph + interrupt() | HumanInTheLoopMiddleware |
+|------|------------------------|--------------------------|
+| 层面 | LangGraph 图层面 | Agent 循环层面 |
+| 粒度 | 节点级别 | 工具调用级别 |
+| 用法 | 手写 `interrupt()` 调用 | 声明式配置 `require_confirmation_for` |
+| 灵活性 | 可在图任意位置暂停 | 局限于工具调用前 |
+| 开箱即用 | 否，需手写暂停恢复逻辑 | 是，配置即用 |
+
+> **选择建议：** 标准 ReAct Agent 需要简单重试和 PII 过滤 → 用 Middleware 一行配置。需要精细控制图结构、自定义暂停位置 → 用 StateGraph + interrupt()。
+
+---
+
+## 四、图可视化：draw_mermaid_png
+
+### 4.1 可视化图和 Agent
+
+LangGraph 内置了把图结构导出为 Mermaid 格式的能力。对 `create_agent` 创建的 Agent 同样适用——你能看到 Agent 内部的 `agent` 节点与 `tools` 节点之间的循环结构：
+
+```python
+"""graph_viz_demo.py — 可视化 Agent 图结构"""
+
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
+from langchain_core.tools import tool
+
+
+@tool
+def get_weather(city: str) -> str:
+    """查询天气。"""
+    return f"{city}：晴"
+
+
+model = init_chat_model("gpt-4o-mini", temperature=0)
+
+agent = create_agent(
+    model=model,
+    tools=[get_weather],
+    system_prompt="你是天气助手。",
+)
+
+# 方法 1：导出 Mermaid 文本
+mermaid_text = agent.get_graph().draw_mermaid()
+print(mermaid_text)
+
+# 方法 2：导出 PNG 图片（需要安装 pygraphviz）
+# agent.get_graph().draw_mermaid_png(output_path="agent_graph.png")
+```
+
+导出的 Mermaid 文本直接复制到支持 Mermaid 渲染的编辑器即可看到图结构：
 
 ```mermaid
 graph LR
-    START([START]) --> llm[llm]
-    llm --> END([END])
+    START([START]) --> agent[agent]
+    agent --> should_continue{should_continue}
+    should_continue -- "tools" --> tools[tools]
+    tools --> agent
+    should_continue -- "end" --> END([END])
 ```
 
-> **和 Day 03 的 ASCII 草图对比：** Day 03 我们让 Claude Code 画 ASCII 草图来"先想清楚再写代码"。今天有了 `draw_mermaid()`，写完代码还能让框架**反向生成精确图**——写之前用 ASCII 草图设计，写之后用 Mermaid 验证，两下对照就能发现"设计的图"和"实际跑的图"差在哪。这是今天副线调试的核心动作之一。
+### 4.2 create_agent 内部结构的可视化
 
----
+`create_agent` 创建的 Agent 底层是一张标准的 ReAct 循环图，包含三个关键部分：
 
-## 五、调试三件套：get_state / draw_mermaid / LangSmith
+| 图元素 | 角色 | 说明 |
+|--------|------|------|
+| `agent` 节点 | LLM 调用 | 把当前 messages 发给模型，拿到回复或 tool_calls |
+| `tools` 节点 | 工具执行 | 执行 LLM 请求的工具调用并返回结果 |
+| `should_continue` 边 | 条件路由 | 检查 LLM 回复是否含 tool_calls，决定继续还是结束 |
 
-### 5.1 Agent 卡住了，怎么查
+```mermaid
+graph TD
+    subgraph create_agent 内部结构
+        START --> agent["agent (LLM 调用)"]
+        agent --> condition{"should_continue"}
+        condition -->|"tools"| tools["tools (工具执行)"]
+        tools --> agent
+        condition -->|"end"| END
+    end
+```
 
-生产里 Agent 最怕"卡住"——既不报错也不返回，停在某个节点不动。这时候要靠"调试三件套"层层定位：
+### 4.3 子图可视化
 
-| 工具 | 看什么 | 什么时候用 |
-|------|--------|-----------|
-| `app.get_state(config)` | 当前状态快照、停在哪、下一步该去哪 | 图暂停/卡住，先看状态停在哪 |
-| `app.get_graph().draw_mermaid()` | 图的拓扑结构 | 怀疑边连错、节点孤立 |
-| LangSmith trace | 每个节点的输入输出、耗时、LLM 调用细节 | 要看执行路径和具体调用 |
-
-### 5.2 一个"Agent 卡住"的调试案例
-
-场景：带 `interrupt()` 的 Agent（Day 05 学过）等用户确认后调用 `update_state` 恢复，结果没反应。
+当子图嵌入主图时，`draw_mermaid()` 会展示主图的节点。子图节点在图中显示为一个普通节点，但你可以分别对主图和子图调用 `draw_mermaid()` 查看各自的结构：
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
+# 主图结构
+print(main_app.get_graph().draw_mermaid())
+# → 主图节点: classifier → fruit_expert / veggie_expert → END
 
-checkpointer = MemorySaver()
-app = graph.compile(checkpointer=checkpointer)
-
-config = {"configurable": {"thread_id": "thread-1"}}
-
-# 第一次调用，图在 interrupt 处暂停
-app.invoke({"messages": [HumanMessage(content="删掉我的账号")]}, config)
-
-# 查状态：确认到底停在哪、next 是什么
-state = app.get_state(config)
-print(state.next)          # ('human_review',) 说明停在 human_review 节点前
-print(state.values)        # 当前状态快照，看 messages 有没有异常
+# 子图结构
+print(fruit_expert.get_graph().draw_mermaid())
+# → 子图内部: agent → tools 循环
 ```
-
-`get_state` 返回的 `next` 字段是关键——它告诉你"下一步要执行哪个节点"。如果 `next` 是空元组 `()`，说明图已经结束；如果是某个节点名，说明图正暂停在那里等触发。**卡住的第一反应永远是 `get_state` 看 `next`。**
-
-### 5.3 LangSmith trace：看执行路径
-
-`get_state` 只看"现在停在哪"，要看"是怎么一步步走到这的"得靠 LangSmith。开启 LangSmith tracing（设环境变量 `LANGSMITH_TRACING=true`），每次 `invoke` 都会在 LangSmith 面板留一条 trace，展开能看到：
-
-- 每个节点的输入 state、输出 partial state
-- LLM 调用的 prompt、completion、token 数、耗时
-- 条件边当时走了哪条分支、为什么
-
-trace 是"事后复盘"的核武器——尤其当 Agent 偶发抽风（大多数时候正常，偶尔死循环），没有 trace 根本无从下手。
 
 ---
 
-## 六、用 Claude Code 调试 Graph（本周副线高潮）
+## 五、副线：Claude Code 调试流式与状态机
 
-### 6.1 把 LangGraph 的输出喂给 Claude Code
+### 5.1 调试三件套
 
-前面三件套各自能查一件事，但要"综合判断卡在哪、为什么卡"，单靠人脑拼凑信息很累。本周副线一路铺垫到这——**把 Mermaid 图和 `get_state` 输出直接贴给 Claude Code，让它帮你分析。**
+当 Agent 流式输出异常、状态卡住或行为不对时，LangGraph 提供了三个工具配合 Claude Code 定位问题：
 
-这比让它画 ASCII 草图（Day 03）又进了一步：Day 03 是"设计前"用它画图，今天是"出问题后"用它诊断图。
+| 工具 | 看什么 | 适合 |
+|------|--------|------|
+| `agent.get_state(config)` | 当前状态快照 + `next` 节点 | 卡住时定位现场 |
+| `agent.get_graph().draw_mermaid()` | 图拓扑结构 | 确认节点连接是否正确 |
+| `stream_events` | 流式输出每一步的 messages / values | 分析逐 token 输出异常 |
 
-### 6.2 对话示例：定位条件边返回了未注册节点
+### 5.2 实战：定位流式输出缺失
 
-```
-你（把以下内容贴给 Claude Code）：
+场景：Agent 在 stream_events 中突然停止输出 token，但图没有报错。
 
-【Mermaid 图】
+```python
+# 第一步：用 get_state 确认图的状态
+snapshot = agent.get_state(config)
+print("next:", snapshot.next)           # 停在哪个节点
+print("values keys:", list(snapshot.values.keys()))
+
+# 第二步：把 Mermaid 图和 get_state 输出给 Claude Code
+# 你复制给 Claude Code：
+"""
+我的 create_agent 在 stream_events 中只输出了前 3 个 token 就停了。
+get_state 输出：
+  next: ('agent',)
+  values: {"messages": [...], "interrupt": [...]}
+
+Mermaid 图：
 graph LR
-    START --> agent[agent LLM]
-    agent --> tools{should_continue}
-    tools -- 'tools' --> tool_node[tool_node]
-    tools -- 'end' --> END
-    tool_node --> agent
+    START --> agent
+    agent --> should_continue
+    should_continue -- tools --> tools
+    should_continue -- end --> END
+    tools --> agent
 
-【get_state 输出】
-next=('tools',)
-values={'messages': [...], 'tool_calls': [...]}
-
-【报错】
-KeyError: "Node 'tool' not found"
-
-【问题】Agent 跑到条件边就报错说找不到节点 'tool'，但图里明明有 tool_node。
-
-Claude Code 分析：
-  问题在条件边的返回值。你的 should_continue 函数返回了 'tool'（单数），
-  但图里注册的节点名是 'tool_node'。条件边的返回值必须和 add_node 注册
-  的名字完全一致。
-
-  修复：
-    def should_continue(state):
-        if state["messages"][-1].tool_calls:
-            return "tools"      # ← 要和 add_node("tools", ...) 一致
-        return "end"
-
-  另外你的 Mermaid 图里标注的是 'tools'，但报错是 'tool'，说明
-  should_continue 在某个分支返回了 'tool'（漏了 s）。统一成 'tools'。
-
-你（按建议改完，跑通）：
-  确实是 should_continue 有个分支写成了 'tool'，漏了 s。改完好了，谢谢！
+流式返回后 next 指向 agent，但 agent 节点没有继续输出 token。
+可能是什么原因？
+"""
 ```
 
-Claude Code 能同时读 Mermaid 图（结构）、`get_state` 输出（运行时状态）、报错信息（症状），交叉比对定位"哪个名字对不上"——这种"结构+状态+症状"三路比对，正是人脑容易漏、AI 擅长的活。
+### 5.3 三路交叉比对法
 
-### 6.3 调试工作流
+Claude Code 调试的核心思路是"三路交叉比对"：
 
-把今天副线总结成一个可复用的调试工作流：
+1. **Mermaid 图** → 看结构对不对（节点是否连好、边是否通到 END）
+2. **get_state** → 看运行时状态对不对（next 应该指向哪个节点、values 字段是否完整）
+3. **stream_events 输出** → 看执行过程对不对（messages 流是否完整、有无中断事件）
 
-1. `app.get_graph().draw_mermaid()` 拿到图结构，贴给 Claude Code
-2. `app.get_state(config)` 拿到当前状态和 `next`，贴给 Claude Code
-3. 把报错/异常行为描述给 Claude Code
-4. 让 Claude Code 给出"最可能的根因 + 修复建议"
-5. 改完跑一遍，把新输出再贴回去验证
+三条信息合在一起，Claude Code 能快速定位"结构正确但运行时异常"的微妙 bug——这类 bug 人脑靠硬读数小时，AI 几秒就能交叉分析出根因。
 
-这套流程比"一个人盯着报错猜"快得多，是本周副线的收尾高潮。
+### 5.4 调试工作流
 
----
+把副线总结成一个可复用的调试流程：
 
-## 动手实验
+```
+Agent 流式异常 / 卡住 / 输出不对
+        │
+        ▼
+① agent.get_graph().draw_mermaid()   → 贴给 Claude Code
+        │
+        ▼
+② agent.get_state(config)            → 贴给 Claude Code
+        │
+        ▼
+③ stream_events 的输出片段           → 贴给 Claude Code
+        │
+        ▼
+④ 让 Claude Code 做三路交叉分析：
+   "Mermaid 图显示节点 A → B，但 get_state 的 next 是 A，
+    stream_events 中 A 节点没有输出 token。哪里不对？"
+        │
+        ▼
+⑤ 按建议修复 → 重新跑 → 把新输出贴回去验证
+```
 
-### 🟢 青铜级：跑通子图嵌入
-
-把第一节的 `subgraph_demo.py` 完整跑通，确认主图 `invoke` 后能拿到 `final_report`。然后用 `app.get_graph().draw_mermaid()` 把主图的 Mermaid 图打印出来，贴进 Obsidian 或 Mermaid Live Editor 渲染，体会"子图作为节点"在图上长什么样。
-
-### 🟡 白银级：并行检索 + updates 流式
-
-实现第二节的 `parallel_search.py`，三路并行检索。然后把 `ainvoke` 换成 `astream(stream_mode="updates")`，观察输出顺序：确认三个 search 节点是否真的并行（耗时接近最长那路而非三路之和）。把 `stream_mode` 换成 `"values"` 再跑一次，对比两种模式的输出差异。
-
-### 🔴 王者级：子图 + 并行 + 流式三合一
-
-把今天的三大件揉到一起：主图有 `START → research(子图) → [search_web, search_kb] 并行 → merge → END`，其中 research 是子图、search_web/search_kb 是并行节点。用 `astream(stream_mode="updates")` 流式跑一遍，记录每个节点完成的顺序。最后把 Mermaid 图贴给 Claude Code，让它帮你确认拓扑是否和预期一致。这就是今天产出文件 `advanced_graph.py` 的目标形态。
-
----
-
-## 踩坑记录 🕳️
-
-**坑 1：子图 State 和主图 State 字段没对齐，数据传不过去**
-原因：子图跑完后，结果要靠"字段名相同"才能传回主图。如果子图用 `findings`、主图用 `report`，主图拿不到子图产出。
-解决：约定一个"接口字段"，子图和主图都用同一个字段名（如 `research_result`）；或在主图的包裹节点里做一次字段映射，把子图内部字段转成主图字段。
-
-**坑 2：并行节点用了普通字段（无 reducer），结果互相覆盖**
-原因：三路并行都返回 `{"results": [...]}`，如果 `results` 没加 `operator.add` reducer，三路会互相覆盖，只剩最后一个回来的那路。
-解决：并行汇合的字段必须用 `Annotated[list, operator.add]`，让 reducer 把多路结果拼接而不是覆盖。这是并行 fan-in 最容易踩的坑。
-
-**坑 3：stream_mode="messages" 拿不到非 LLM 节点的输出**
-原因：`messages` 模式只流式 LLM 的 token，纯 Python 节点（不调 LLM）不会有 token 流出。
-解决：要看非 LLM 节点的进度，用 `stream_mode="updates"`（节点级）；要同时看 token 和节点进度，`stream_mode` 可以传列表 `["messages", "updates"]`，LangGraph 会用元组区分来源。
-
-**坑 4：draw_mermaid() 报错或画出来的图缺节点**
-原因：图还没 `compile()` 就调 `draw_mermaid()`，或者节点是用 `add_node` 注册了但还没连边（孤立节点）。
-解决：先 `compile()` 再 `draw_mermaid()`；孤立节点在图上不会出现，先确认所有节点都连了边。条件边的分支目标如果拼写不一致，图上也会出现"断头路"。
-
-**坑 5：get_state 的 next 是空但 Agent 没返回结果**
-原因：`next == ()` 表示图已结束，但如果你用了 `interrupt()`，图是"暂停"而非"结束"——这时候要查 `state.tasks` 看 interrupt 状态，而不是 `next`。
-解决：区分"正常结束"（`next=()` 且无 pending interrupt）和"中断等待"（有 interrupt 任务）。恢复用 `Command(resume=...)` 或 `update_state`，别重复 `invoke`。
+> **和 Day 03 的 ASCII 草图对比：** Day 03 让 Claude Code 画 ASCII 草图来"先想清楚再写代码"。今天让它基于 `draw_mermaid()` 精确图和 `get_state` 运行时数据做诊断——从"设计辅助"进化到"调试诊断"。这是副线从 Week 03 走到 Week 06 的能力跃迁。
 
 ---
 
-## 副线笔记：Claude Code 调试状态机实战心得
+## 六、动手实验
 
-本周副线从 Day 01 的"让 Claude Code 审查 LCEL 链"，到 Day 03 的"画 ASCII 草图"，一路走到今天"用 Claude Code 调试 Graph"——这条线在 Day 06 迎来高潮。下面是三个 LangGraph 最常见的 bug 模式，以及怎么用 Claude Code + `get_state` 定位。
+### 🟢 青铜级：跑通 stream_events 消费所有事件类型
 
-### Bug 模式 1：死循环（图永远不结束）
+把第一节的 `stream_events_demo.py` 完整跑通，分别观察 `.messages`（逐 token）、`.values`（状态快照）、`.interrupts`（中断）的输出。然后用 `stream(version="v2")` 再跑一遍，对比两种 API 的差异。
 
-**症状：** Agent 一直在 agent ↔ tool_node 之间转圈，`next` 永远不是 `END`。
-**定位：** `get_state` 看 `next` 和 `values`——如果 `next` 一直是同一个节点、messages 列表无限增长，就是死循环。把 Mermaid 图 + `get_state` 输出贴给 Claude Code，让它查"条件边的终止条件是不是永远不触发"。最常见根因：`should_continue` 永远返回 `"tools"`，或者 LLM 一直发起同样的 tool_call。
+### 🟡 白银级：create_agent 做子图嵌入主图
 
-### Bug 模式 2：状态字段丢失（下游节点拿不到上游产出）
+跑通第二节的 `subgraph_create_agent.py`，让主图根据用户输入路由到水果/蔬菜专家 Agent。然后用 `main_app.get_graph().draw_mermaid()` 打印主图 Mermaid 图，再用 `fruit_expert.get_graph().draw_mermaid()` 打印子图内部结构，观察两张图的层级关系。
 
-**症状：** 某个节点 `state["xxx"]` 报 KeyError，或拿到的是初始空值。
-**定位：** 用 `stream_mode="updates"` 看每个节点到底更新了哪些字段。如果上游节点没返回 `xxx`、或 `xxx` 没加 reducer 被覆盖了，下游就拿不到。贴给 Claude Code 时附上 State 定义 + 各节点的返回值，让它比对"谁该写这个字段、谁把它覆盖了"。最常见根因：漏了 reducer，或节点返回了全 state 导致覆盖。
+### 🔴 王者级：三合一高级 Agent
 
-### Bug 模式 3：条件边返回了未注册的节点名
+把今天三大件揉到一起：**stream_events（流式）+ 子图（专家 Agent）+ Middleware（中间件）**。创建一个 `advanced_agent.py`，满足：
 
-**症状：** `KeyError: Node 'xxx' not found`，图在条件边处崩溃。
-**定位：** 把 Mermaid 图和 `should_continue` 函数贴给 Claude Code，让它逐字比对"函数返回的字符串"和"`add_node` 注册的名字"。最常见根因：单复数拼错（`tool` vs `tools`）、大小写不一致、分支返回值和注册名对不上。这个坑 Day 03 踩坑记录提过，今天用 Claude Code 系统化定位。
+1. 主图包含两个专家子图（水果专家 / 蔬菜专家），用条件分支路由
+2. 主图的 `create_agent` 配置了 `ModelRetryMiddleware` 和 `PIIMiddleware`
+3. 调用时用 `stream_events(version="v3")` 消费所有事件类型
+4. 用 `draw_mermaid_png()` 保存可视化图
+5. 把流式输出和 Mermaid 图贴给 Claude Code，让它确认拓扑是否正确
 
-### 核心心得：可观测性是 Agent 工程化的命脉
+这就是今天产出文件 `advanced_agent.py` 的目标形态。
 
-Week 03 手写 Agent 时，调试靠 `print` 和 `pdb`，状态散在变量里。到了 Week 06，状态被收进 State、控制流变成图、执行有 Checkpointer 存档——**可观测性的基础设施终于齐了**。`get_state` 看状态、`draw_mermaid` 看结构、LangSmith 看路径、Claude Code 做综合诊断，四件套凑齐，Agent 才从"能跑的脚本"变成"可运维的系统"。
+---
 
-> **一句话：** Agent 工程化的命脉不是"让它更聪明"，而是"让它可观测"。不可观测的 Agent 上不了生产——你不知道它什么时候会抽风，抽风了你也不知道为什么。今天的副线，就是把这个命脉握在手里。
+## 七、踩坑记录 🕳️
+
+### 坑 1：stream_events v3 遍历时跳过了某些帧
+
+**症状：** for 循环遍历 stream 时，感觉少了一些节点的事件帧。
+
+**原因：** `stream_events(version="v3")` 默认不会在每个节点后都产生帧——如果节点未更新任何状态或 LLM 无输出，对应帧可能为空。
+
+**解决：** 在 for 循环里不要假设每一帧都有 messages 或 values，用 `if snapshot.messages:` / `if snapshot.values:` 做防御检查。如果需要"每个节点都有 event"，考虑用 `stream(version="v2")` + `event["type"]` 过滤。
+
+### 坑 2：子图 Agent 的 State 和主图 State 字段冲突
+
+**症状：** 主图定义的 `final_answer` 字段被子图的内部状态覆盖了，或者子图返回的字段没传回主图。
+
+**原因：** 子图的 State 定义和主图 State 定义中如果有同名字段但类型不同，LangGraph 的合并不一定按预期工作。特别是 `messages` 这样的 `add_messages` 字段，子图和主图各有各的 reducer。
+
+**解决：** 主图和子图 State 尽量不要定义同名字段。主图通过"包装节点"显式从子图的最终 State 中提取所需数据。如果必须共享字段，确保两者类型和 reducer 一致。
+
+### 坑 3：Middleware 配置后 Agent 行为不变
+
+**症状：** `create_agent(..., middleware=[...])` 加了中间件，但异常仍然没被兜底，PII 仍然没被过滤。
+
+**原因：** 最常见的原因是中间件导入路径不正确。2026 年的官方导入路径是 `from langchain.agents.middleware import ...`，而非旧版的 `from langchain.middleware`。另一个可能是 `create_agent` 版本不支持 middleware 参数（需要 LangChain >= 2026.04）。
+
+**解决：** 检查 LangChain 版本并确认导入路径。在配置中加入调试日志：`middleware=[ModelRetryMiddleware(max_retries=3, log_retries=True)]`，观察中间件日志确认是否被触发。
+
+### 坑 4：draw_mermaid_png 导出报错或生成空图
+
+**症状：** `agent.get_graph().draw_mermaid_png("output.png")` 报错，或者生成的 PNG 是空白/不完整。
+
+**原因：** `draw_mermaid_png()` 需要可选依赖 `pygraphviz` 或 `graphviz`，如果未安装会报 `ImportError`。另外如果图还没 `compile()` 就渲染，也可能出现结构不完整。
+
+**解决：** 先安装依赖：`pip install pygraphviz`。先用 `agent.get_graph().draw_mermaid()` 导出文本版本，在 Mermaid Live Editor 里验证结构正确，再用 `draw_mermaid_png()` 导出图片。如果只是 Mermaid 文本就能满足需求，无需强求 PNG 导出。
+
+### 坑 5：get_stream_writer 在非流式上下文中报错
+
+**症状：** 工具函数里用了 `get_stream_writer()`，但在 `invoke`（非流式）调用时报错。
+
+**原因：** `get_stream_writer()` 只在 `stream` / `stream_events` 的上下文中可用。在 `invoke` 模式下没有活跃的流 writer。
+
+**解决：** 用 `try-except` 包裹，让工具在非流式模式下优雅降级：
+
+```python
+from langgraph.config import get_stream_writer
+
+@tool
+def my_tool(query: str) -> str:
+    try:
+        writer = get_stream_writer()
+        writer({"type": "progress", "data": {"msg": "处理中..."}})
+    except Exception:
+        pass   # 非流式模式下静默跳过
+    return "结果"
+```
+
+---
+
+## 八、副线笔记：Claude Code 调试心得
+
+### 8.1 流式异常最常见的三种表现
+
+本周副线在调试流式和状态机时，遇到了三种典型异常模式：
+
+| 模式 | 症状 | Claude Code 推荐检查方向 |
+|------|------|------------------------|
+| **流中断** | 输出了几个 token 后突然停止，无报错 | 检查 LLM 节点是否在非流式模式下产生了 `AIMessage`（整块返回）而非 `AIMessageChunk`（逐 token） |
+| **状态回滚** | 某一步之后 values 回到更早的状态 | 检查 reducer 是否正确（是否缺少 `operator.add` 导致覆盖而非追加） |
+| **子图未执行** | stream 中跳过了子图节点的事件 | 检查条件边的返回值是否和 `add_node` 注册的名字完全一致 |
+
+### 8.2 三件套配合 Claude Code 的黄金流程
+
+```
+Agent 行为异常
+    │
+    ├─①─ agent.get_graph().draw_mermaid() → 贴给 Claude Code
+    │    （确认结构正确）
+    │
+    ├─②─ agent.get_state(config) → 贴给 Claude Code
+    │    （确认运行时状态）
+    │
+    ├─③─ 把 stream_events 输出片断贴给 Claude Code
+    │    （确认执行路径）
+    │
+    └─④─ Claude Code 三路交叉分析 → 给出诊断 + 修复建议
+```
+
+### 8.3 核心心得：可观测性是 Agent 工程化的命脉
+
+Week 03 手写 Agent 时，调试靠 `print` 和 `pdb`，状态散在变量里。到了 Week 06，状态被收进 State、控制流变成图、执行有 `stream_events` 可观测——**可观测性的基础设施终于齐了**。
+
+- `get_state` → 看运行时状态
+- `draw_mermaid()` → 看图结构
+- `stream_events` → 看执行过程
+- 把这些喂给 Claude Code → 做综合诊断
+
+四件套凑齐，Agent 才从"能跑的脚本"变成"可运维的系统"。
+
+> **一句话：** Agent 工程化的命脉不是"让它更聪明"，而是"让它可观测"。不可观测的 Agent 上不了生产——你不知道它什么时候会抽风，抽风了你也不知道为什么。今天的 stream_events / draw_mermaid / get_state 就是把这个命脉握在手里。
 
 ---
 
 ## 今日产出检查清单
 
-- [ ] 理解子图的独立 State 与复用价值，跑通 `subgraph_demo.py` 主图嵌入子图
-- [ ] 实现并行 fan-out/fan-in，确认并行耗时接近最长那路而非各路之和
-- [ ] 区分 `stream_mode` 四种模式，写出 `astream(stream_mode="messages")` 逐 token 流式
-- [ ] 用 `draw_mermaid()` 导出图结构并渲染，确认拓扑与预期一致
-- [ ] 用 `get_state` + Claude Code 定位过至少一个 bug（死循环/字段丢失/节点名不匹配）
-- [ ] 产出 `advanced_graph.py`（子图 + 并行 + 流式三合一）并附调试日志
+- [ ] 理解 `stream_events(version="v3")` 的 typed projections（messages / values / interrupts / output），跑通完整消费循环
+- [ ] 区分 `stream(version="v2")` 和 `stream_events(version="v3")`，能按场景选择
+- [ ] 理解子图的"独立 State"与"即插即用"特性，用 `create_agent` 创建子 Agent 嵌入主图
+- [ ] 在 `create_agent` 中配置 `ModelRetryMiddleware`、`ToolRetryMiddleware`、`PIIMiddleware`，理解中间件执行顺序
+- [ ] 用 `agent.get_graph().draw_mermaid()` 导出图结构文本，理解 Agent 内部 agent⇄tools 循环
+- [ ] 产出 `advanced_agent.py`（子图 + stream_events + Middleware 三合一）并附调试日志
 
 ---
 
-> **下一课预告：Day 07 — 综合实战：多步推理 Agent**。把本周的 LangChain 组件、LangGraph 图编排、Checkpointer 持久化、子图/并行/流式全部用上，搭一个"路线推荐 → 天气查询 → 装备清单 → 出行建议"的多步推理 Agent，FastAPI 服务化 + Web UI，全程 Claude Code 结对编程。今天的高级模式会在 Day 07 真正落地——并行查天气和路线、流式把建议推给前端、子图封装装备推荐子流程。本周收官战。
+> **下一课预告：Day 07 — 综合实战：多步推理 Agent**。把本周的 LangChain 组件（`create_agent` / `@tool`）、LangGraph 图编排（StateGraph）、持久化（Checkpointer / interrupt）、高级模式（stream_events / 子图 / Middleware）全部用上，搭一个"路线推荐 → 天气查询 → 装备清单 → 出行建议"的多步推理 Agent，FastAPI 服务化 + Web UI，全程 Claude Code 结对编程。今天的高级模式会在 Day 07 真正落地——stream_events 把建议逐 token 推给前端、子图封装装备推荐子流程、Middleware 兜底异常重试。本周收官战。

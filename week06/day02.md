@@ -1,146 +1,27 @@
-# Day 02 — LangChain 工具调用：@tool / bind_tools
+# Day 02 — 工具调用深入：@tool / ToolRuntime / 状态注入
 
 ## 学习目标
 
-Day 01 我们用 LCEL 把"模型 + Prompt + 输出解析"串成了链，但那条链只会说话、不会动手。今天把 Week 03 手写的 Function Calling 完整流程（定义 schema → 解析 tool_calls → 执行 → 回传结果）整体换成 LangChain 框架写法。核心是三件事：用 `@tool` 装饰器一行生成工具 schema、用 `bind_tools` 把工具绑到模型上、用 `ToolMessage` 把执行结果喂回模型。今天还**不用 LangGraph**，纯 LangChain 手写一个工具循环——为 Day 04 的图循环打底。
+Day 01 介绍了 LCEL 链式组装，但 Agent 的核心是"模型+工具"的交互循环。今天从 Week 03 手写 Function Calling 出发，切入 LangChain 2026 年的工具系统：`@tool` 装饰器用函数签名 + docstring 自动生成 tool schema；`ToolRuntime` 运行时注入让工具能读写 Agent 状态、长期记忆、流式输出——这些在 Week 03 手写时要么做不到、要么需要大量样板代码。配套产出 `tool_calling_demo.py`。
 
 学完今天你能：
-1. 用 `@tool` 装饰器把普通函数变成 LangChain 工具，并说清 schema 是从 docstring + 类型注解哪里推断出来的
-2. 用 `model.bind_tools(...)` 绑定工具并解析返回的 `AIMessage.tool_calls`，区分它和 Week 03 手写的原始 JSON 结构
-3. 手写一个完整的"解析 → 执行 → ToolMessage 回传 → 再调用"工具循环（纯 LangChain，不用图）
-4. 对照 Week 03 day05 的工具六原则，判断 `@tool` 自动落了哪几条、哪几条还得自己写
+1. 用手写 JSON Schema + 注册表的痛点对比，说清 `@tool` 替我省了哪几大块体力活
+2. 用 `@tool` 定义带类型注解和 Pydantic 参数约束的工具，并解释 schema 从哪来的
+3. **用 `ToolRuntime` 在工具函数里访问 Agent 状态、长期记忆、流式写入——这是 2026 年新 API，也是今天最重要的一条**
+4. 把工具列表传给 `create_agent`，让框架自动管理 tool 调用循环，说清对比手写省了多少代码
 
 ---
 
-## 一、回顾 Week 03 手写 Function Calling
+## 一、回顾 Week 03 手写 Function Calling：四个痛点
 
-Week 03 Day 02 我们不依赖任何框架，纯 `httpx + JSON` 实现了一整套 Function Calling。当时干了四件体力活：
+Week 03 Day 02 我们纯手写了一整套 Function Calling：`httpx` 调 OpenAI API、手写 JSON Schema、手动解析 `tool_calls`、手动 dispatch、手动构造 tool 角色消息。当时这么干是为了"看穿黑盒"，但也付出了四笔重复劳动。
 
-1. **手写 Tool Schema**：每个工具要写一个 20 多行的 JSON Schema 字典，`name / description / parameters / properties / required` 一个字段都不能少。
-2. **手动解析 tool_calls**：从 `response["choices"][0]["message"]["tool_calls"]` 里抠出 `function.name` 和 `function.arguments`，还要 `json.loads(arguments)`——因为 arguments 是**字符串不是字典**。
-3. **手动 dispatch**：维护一个 `TOOL_REGISTRY: dict[str, Callable]` 注册表，自己写 `execute_tool_call` 查表 + `**kwargs` 解包 + try/except。
-4. **手动构造 tool 角色消息**：把结果包成 `{"role": "tool", "tool_call_id": "...", "content": "..."}`，还要记得把带 `tool_calls` 的 assistant 消息也塞回 messages。
+### 痛点 1：手写 JSON Schema，改一处漏一处
 
-当时的 `function_calling.py` 单文件就有 **300+ 行**，其中工具定义 + 注册表 + 执行引擎就占了近 150 行，真正和"业务"相关的只有两个 impl 函数。这套手写非常有价值——它让你看穿了框架的黑盒；但也确实啰嗦。
-
-| Week 03 手写环节 | 当时写的代码量 | 痛点 |
-|------------------|---------------|------|
-| 定义 2 个工具的 JSON Schema | 约 40 行 | 改一个参数要同步改 schema 和函数签名两处，容易漏 |
-| TOOL_REGISTRY 注册表 + execute_tool_call | 约 40 行 | 每加一个工具都要手动注册一次 |
-| json.loads(arguments) + tool_call_id 匹配 | 散落各处 | 字符串/字典类型混淆是高频 bug |
-| 构造 tool 角色消息 + assistant 消息回填 | 约 20 行 | 消息顺序错了 API 直接 422 |
-
-LangChain 的承诺是：**把"函数即工具"这件事变成一行装饰器**，schema 自动推断、注册自动完成、tool_calls 自动解析成结构化对象。今天就来验收这个承诺兑现了多少。
-
----
-
-## 二、@tool 装饰器：函数即工具
-
-### 2.1 最小示例
-
-`@tool` 的魔法在于：它从**函数签名 + docstring**自动生成 tool schema，你不用再手写一行 JSON。
+每个工具要写 20 多行的 JSON Schema 字典，`name / description / parameters / properties / required` 一个字段不能少。改一个参数名，得同步改函数签名和 Schema 两处。
 
 ```python
-"""tool_calling_demo.py — 第一部分：用 @tool 定义工具"""
-from langchain_core.tools import tool
-
-
-@tool
-def get_weather(city: str) -> str:
-    """查询指定城市的当前天气。city 为城市名，如 '北京'、'Tokyo'。"""
-    # 实际项目这里会调天气 API，这里用本地数据演示
-    weather_db = {"北京": "晴 25°C", "Tokyo": "小雨 18°C", "上海": "多云 28°C"}
-    return weather_db.get(city, f"{city}：暂无天气数据")
-```
-
-装饰完后，`get_weather` 不再是普通函数，而是一个 `BaseTool` 对象，自动长出了三个属性：
-
-```python
-print(get_weather.name)         # 'get_weather'   ← 取自函数名
-print(get_weather.description)  # '查询指定城市的当前天气...' ← 取自 docstring
-print(get_weather.args)         # {'city': {'type': 'string', ...}} ← 取自类型注解
-```
-
-### 2.2 schema 推断规则
-
-`@tool` 到底从哪里读什么？规则很清晰：
-
-| schema 字段 | 来源 | 说明 |
-|------------|------|------|
-| `name` | 函数名 | 可用 `@tool("自定义名")` 覆盖 |
-| `description` | docstring 第一行/全文 | **没有 docstring 就没有 description**，LLM 会瞎猜 |
-| 参数名 | 函数形参 | 直接用形参名，建议用全称（呼应 Week 03 day05 原则 3） |
-| 参数类型 | 类型注解 `: str / : int` | `str/int/float/bool/list/dict` 都能推断，复杂类型建议用 Pydantic |
-| `required` | 没有默认值的形参 | 有默认值的参数自动标为可选 |
-| 参数描述 | docstring 里的 Args 段 | 写 Google 风格 `Args:` 会被解析进每个参数的 description |
-
-### 2.3 三个工具示例 + Pydantic 进阶
-
-简单参数用类型注解就够了；参数多、有约束（枚举、范围）时，用 Pydantic `args_schema` 更稳。下面给三个工具，正好是 Day 07 多步推理 Agent 要用的"路线推荐 → 天气 → 距离"三件套。
-
-```python
-"""tool_calling_demo.py — 第二部分：三个工具 + Pydantic args_schema"""
-from pydantic import BaseModel, Field
-from langchain_core.tools import tool
-
-
-# ── 工具 1：简单参数，纯类型注解 ──────────────────────
-@tool
-def get_weather(city: str, unit: str = "celsius") -> str:
-    """查询指定城市的当前天气。
-
-    Args:
-        city: 城市名，如 '北京'、'上海'、'Tokyo'。
-        unit: 温度单位，'celsius'（默认）或 'fahrenheit'。
-    """
-    weather_db = {"北京": (25, "晴"), "上海": (28, "多云"), "Tokyo": (18, "小雨")}
-    temp, cond = weather_db.get(city, (20, "未知"))
-    if unit == "fahrenheit":
-        temp = temp * 9 // 5 + 32
-    return f"{city}：{cond}，{temp}°{'F' if unit == 'fahrenheit' else 'C'}"
-
-
-# ── 工具 2：用 Pydantic 做参数约束（枚举 + 范围）─────
-class SearchRoutesInput(BaseModel):
-    """路线检索工具的输入参数。"""
-    location: str = Field(description="徒步起点，如 '北京'、'杭州'")
-    difficulty: str = Field(
-        description="难度等级",
-        enum=["easy", "medium", "hard"],   # ← 枚举约束，LLM 只能选这三个
-    )
-    max_results: int = Field(default=3, ge=1, le=10, description="返回路线数，1-10")
-
-
-@tool(args_schema=SearchRoutesInput)
-def search_routes(location: str, difficulty: str, max_results: int = 3) -> str:
-    """根据地点和难度检索徒步路线。当用户想找徒步/爬山路线时使用。"""
-    # 模拟检索（Day 07 会接 Week 05 的向量库）
-    routes = {
-        ("北京", "easy"): ["香山、百望山、奥林匹克森林公园"],
-        ("杭州", "hard"): ["千八穿越、天目山七尖"],
-    }
-    hits = routes.get((location, difficulty), [f"{location} 暂无 {difficulty} 路线"])
-    return f"为 {location}({difficulty}) 找到 {len(hits[:max_results])} 条：{'、'.join(hits[:max_results])}"
-
-
-# ── 工具 3：返回结构化数据 ──────────────────────────
-@tool
-def calculate_distance(start: str, end: str) -> str:
-    """计算两个地点之间的直线距离（公里）。用于规划出行路线。"""
-    # 模拟距离表
-    dist_table = {("北京", "上海"): 1213, ("北京", "Tokyo"): 2100, ("杭州", "上海"): 175}
-    d = dist_table.get((start, end)) or dist_table.get((end, start), None)
-    if d is None:
-        return f"暂无 {start} ↔ {end} 的距离数据"
-    return f"{start} → {end} 直线距离约 {d} 公里"
-```
-
-### 2.4 对比 Week 03 手写 JSON Schema
-
-同一个 `get_weather`，两种写法的代码量对比：
-
-```python
-# ── Week 03 手写（约 22 行 JSON）──
+# Week 03 手写：一个工具的 JSON Schema 就要 20+ 行
 get_weather_schema = {
     "type": "function",
     "function": {
@@ -157,231 +38,403 @@ get_weather_schema = {
         },
     },
 }
-# 还要单独写 impl 函数 + 注册到 TOOL_REGISTRY
+```
+
+### 痛点 2：手动解析 tool_calls + json.loads
+
+OpenAI 返回的 `arguments` 是**字符串不是字典**，每次都要 `json.loads` 再解包，类型错误是高频 bug。
+
+```python
+# Week 03 手写：arguments 是字符串，必须 json.loads
+tool_calls = response["choices"][0]["message"]["tool_calls"]
+for tc in tool_calls:
+    name = tc["function"]["name"]
+    args = json.loads(tc["function"]["arguments"])  # ← 字符串！容易忘
+```
+
+### 痛点 3：手动维护注册表 + dispatch
+
+每个工具要手动注册到 `TOOL_REGISTRY`，dispatch 时查表 + `**kwargs` 解包 + try/except，每加一个工具都要三处修改（Schema + impl + 注册表）。
+
+### 痛点 4：手动构造 tool 角色消息 + 维护消息顺序
+
+结果要包成 `{"role": "tool", "tool_call_id": "...", "content": "..."}` 字典，带 `tool_calls` 的 assistant 消息也必须回填，顺序错了（ToolMessage 在 AIMessage 前面）API 直接 422。
+
+### 痛点总结表
+
+| 维度 | Week 03 手写 | 代码量 | 根本问题 |
+|------|-------------|--------|---------|
+| **Schema 定义** | 手写 JSON Schema 字典 | 约 22 行/工具 | 函数定义与 Schema 分离，改一处漏一处 |
+| **tool_calls 解析** | `json.loads(arguments)` 字符串拆包 | 约 5 行/次 | 字符串/字典类型混淆，运行时才能发现 |
+| **注册与 dispatch** | 手动 `TOOL_REGISTRY` 注册表 + 查表执行 | 约 40 行 | 每加工具需改三处，耦合高 |
+| **消息构造** | 手动构造 tool 角色字典 + 维护消息顺序 | 约 20 行 | 顺序错了 API 报 422，无编译期检查 |
+
+LangChain 2026 的工具系统把上面 4 个痛点全部消灭：`@tool` 自动生成 Schema、自动注册；`create_agent` 自动管理 tool_choice 解析 + dispatch + 消息回填；`ToolRuntime` 更是手写时代完全无法实现的能力。
+
+---
+
+## 二、@tool 装饰器：函数签名 + 类型注解 → 自动 tool schema
+
+### 2.1 一句话原理
+
+`@tool` 的魔法在于：它从**函数名 → name**、**docstring → description**、**类型注解 → parameters 的 properties** 三处自动推断，你不用再手写一行 JSON Schema。
+
+```python
+"""tool_calling_demo.py — 第一部分：@tool 基础定义"""
+from langchain.tools import tool
 
 
-# ── Week 06 @tool（约 5 行）──
+@tool
+def get_weather(city: str) -> str:
+    """查询指定城市的当前天气。city 为城市名，如 '北京'、'Tokyo'。"""
+    weather_db = {"北京": "晴 25°C", "Tokyo": "小雨 18°C", "上海": "多云 28°C"}
+    return weather_db.get(city, f"{city}：暂无天气数据")
+```
+
+装饰完后，`get_weather` 不再是普通函数，而是一个 `BaseTool` 对象：
+
+```python
+print(get_weather.name)         # 'get_weather'                    ← 取自函数名
+print(get_weather.description)  # '查询指定城市的当前天气...'       ← 取自 docstring
+print(get_weather.args)         # {'city': {'type': 'string'}}     ← 取自类型注解
+```
+
+### 2.2 Schema 推断规则
+
+| Schema 字段 | 来源 | 说明 |
+|------------|------|------|
+| `name` | 函数名 | 可用 `@tool("自定义名")` 覆盖 |
+| `description` | docstring 第一行 / 全文 | **没有 docstring 就没有 description**，LLM 会瞎猜或不调 |
+| 参数名 | 函数形参 | 直接作为 JSON Schema 的 property 名 |
+| 参数类型 | 类型注解 `: str / : int / : float` | `str/int/float/bool/list/dict` 都能推断 |
+| `required` | 没有默认值的形参 | 没有默认值的参数自动标为 required |
+| 参数描述 | docstring 的 `Args:` 段 | Google 风格 docstring 的 `Args:` 会被解析进每个参数的 description |
+
+### 2.3 三个工具示例
+
+下面定义三个工具，覆盖"简单参数 / Pydantic 约束 / 纯文本返回"三种场景：
+
+```python
+"""tool_calling_demo.py — 第二部分：三个工具定义"""
+
+# ── 工具 1：纯类型注解，简单参数 ──────────────────────
 @tool
 def get_weather(city: str, unit: str = "celsius") -> str:
-    """获取指定城市的当前天气信息。city 为城市名，unit 为温度单位。"""
-    ...
+    """查询指定城市的当前天气。
+
+    Args:
+        city: 城市名，如 '北京'、'上海'。
+        unit: 温度单位，'celsius'（默认）或 'fahrenheit'。
+    """
+    weather_db = {"北京": (25, "晴"), "上海": (28, "多云"), "Tokyo": (18, "小雨")}
+    temp, cond = weather_db.get(city, (20, "未知"))
+    if unit == "fahrenheit":
+        temp = temp * 9 // 5 + 32
+    return f"{city}：{cond}，{temp}°{'F' if unit == 'fahrenheit' else 'C'}"
+
+
+# ── 工具 2：Pydantic BaseModel + Field 做参数约束 ──────
+from pydantic import BaseModel, Field
+
+
+class SearchRoutesInput(BaseModel):
+    """路线检索工具的输入参数。"""
+    location: str = Field(description="徒步起点，如 '北京'、'杭州'")
+    difficulty: str = Field(
+        description="难度等级",
+        enum=["easy", "medium", "hard"],      # ← 枚举约束，LLM 只能选这三个
+    )
+    max_results: int = Field(default=3, ge=1, le=10, description="返回路线数，1-10")
+
+
+@tool(args_schema=SearchRoutesInput)
+def search_routes(location: str, difficulty: str, max_results: int = 3) -> str:
+    """根据地点和难度检索徒步路线。当用户想找徒步/爬山路线时使用。
+
+    Args:
+        location: 起点地名
+        difficulty: 难度等级 easy / medium / hard
+        max_results: 返回的最大路线数
+    """
+    routes = {
+        ("北京", "easy"): ["香山", "百望山", "奥林匹克森林公园"],
+        ("杭州", "hard"): ["千八穿越", "天目山七尖"],
+    }
+    hits = routes.get((location, difficulty), [f"{location} 暂无 {difficulty} 路线"])
+    return f"为 {location}({difficulty}) 找到 {len(hits[:max_results])} 条：{'、'.join(hits[:max_results])}"
+
+
+# ── 工具 3：纯函数，返回文本 ──────────────────────────
+@tool
+def calculate_distance(start: str, end: str) -> str:
+    """计算两个地点之间的直线距离（公里）。用于规划出行路线。
+
+    Args:
+        start: 起点地名
+        end: 终点地名
+    """
+    dist_table = {("北京", "上海"): 1213, ("北京", "Tokyo"): 2100, ("杭州", "上海"): 175}
+    d = dist_table.get((start, end)) or dist_table.get((end, start), None)
+    if d is None:
+        return f"暂无 {start} ↔ {end} 的距离数据"
+    return f"{start} → {end} 直线距离约 {d} 公里"
 ```
 
-| 维度 | Week 03 手写 | Week 06 @tool |
-|------|-------------|---------------|
-| schema 与 impl | 分离两处，改一处漏一处 | 一处，函数即 schema |
-| description | 手写字符串 | docstring 自动读 |
-| 参数约束 | 手写 JSON Schema | 类型注解 / Pydantic |
-| 注册 | 手动 `TOOL_REGISTRY[name] = func` | 装饰器自动完成 |
-| 单工具代码量 | 约 30 行 | 约 5 行 |
+### 2.4 args_schema 高级用法：Pydantic Field
+
+当工具参数有**枚举值、数值范围、复杂嵌套**时，用 Pydantic `Field` 比纯类型注解更稳：
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+
+class BookHotelInput(BaseModel):
+    city: str = Field(description="城市名，如 '北京'")
+    hotel_name: str = Field(description="酒店名称")
+    room_type: Literal["single", "double", "suite"] = Field(
+        default="double", description="房型"
+    )
+    nights: int = Field(default=1, ge=1, le=30, description="入住晚数，1-30")
+
+
+@tool(args_schema=BookHotelInput)
+def book_hotel(city: str, hotel_name: str, room_type: str = "double", nights: int = 1) -> str:
+    """预订酒店房间。当用户需要订酒店时使用。"""
+    return f"已预订 {city} {hotel_name} {room_type}房 × {nights}晚"
+```
+
+`Field` 的 `enum` / `ge` / `le` / `description` 会被 LangChain 自动映射到 JSON Schema 的 `enum` / `minimum` / `maximum` / `description` 字段，LLM 能直接看到约束，大幅提高参数合规率。
 
 ---
 
-## 三、bind_tools：把工具绑到模型上
+## 三、ToolRuntime 运行时注入（2026 年新 API——重点）
 
-### 3.1 绑定与调用
+### 3.1 什么是 ToolRuntime
 
-`bind_tools` 返回一个"绑定了工具的模型 Runnable"，调用方式和普通模型一样，只是返回的 `AIMessage` 会带 `tool_calls` 字段。
+`ToolRuntime` 是 LangChain 2026 年引入的**运行时上下文注入**机制。工具函数的参数名只要写成 `runtime: ToolRuntime`，LangChain 就会自动注入一个 `ToolRuntime` 对象——这个参数**不会暴露给 LLM**，LLM 看不到它、不会尝试填充它。
 
 ```python
-"""tool_calling_demo.py — 第三部分：bind_tools 绑定与调用"""
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage
+from langchain.tools import tool, ToolRuntime
+```
 
-# Day 01 用过的 init_chat_model，统一初始化
+### 3.2 ToolRuntime 可访问的资源
+
+| 属性 | 类型 | 用途 | 示例 |
+|------|------|------|------|
+| `runtime.state` | `dict` | 当前 Agent 状态（messages + 自定义字段） | `runtime.state["messages"]` |
+| `runtime.context` | `dict` | 调用时传入的不可变上下文（用户 ID 等） | `runtime.context.get("user_id")` |
+| `runtime.store` | `BaseStore` | 长期记忆，跨会话持久 | `await runtime.store.aput(...)` |
+| `runtime.stream_writer` | `Callable` | 实时流式更新 | `runtime.stream_writer("进度: 50%")` |
+| `runtime.execution_info` | `dict` | 执行信息（thread_id, run_id, node_attempt） | `runtime.execution_info["thread_id"]` |
+| `runtime.tool_call_id` | `str` | 当前工具调用的 ID | 匹配 ToolMessage 的 tool_call_id |
+
+### 3.3 用 ToolRuntime 访问 Agent 状态
+
+```python
+"""tool_calling_demo.py — 第三部分：ToolRuntime 访问状态和上下文"""
+
+@tool
+def check_user_history(query: str, runtime: ToolRuntime) -> str:
+    """检查用户历史记录中是否已有相关信息，避免重复查询。
+
+    Args:
+        query: 用户的查询内容
+    """
+    # 1) 读取 Agent 当前状态中的消息历史
+    messages = runtime.state.get("messages", [])
+    history_count = len(messages)
+    user_msg_count = sum(1 for m in messages if getattr(m, "type", "") == "human")
+
+    # 2) 读取调用时传入的不可变上下文
+    user_id = runtime.context.get("user_id", "anonymous")
+    session_id = runtime.context.get("session_id", "unknown")
+
+    # 3) 读取执行信息
+    thread_id = runtime.execution_info.get("thread_id", "N/A")
+
+    # 4) 流式输出进度（前端可实时显示）
+    runtime.stream_writer(f"正在查询用户 {user_id} 的历史记录...")
+
+    # 模拟历史查询
+    return (
+        f"用户 {user_id}（会话 {session_id}，线程 {thread_id}）：\n"
+        f"本轮已有 {history_count} 条消息（其中用户发了 {user_msg_count} 条）。\n"
+        f"查询词 '{query}' 的历史匹配结果：无重复记录。"
+    )
+```
+
+### 3.4 用 ToolRuntime 访问长期记忆（store）
+
+`runtime.store` 是一个 `BaseStore` 接口，支持跨会话的持久化键值存取：
+
+```python
+"""tool_calling_demo.py — 第四部分：ToolRuntime 长期记忆"""
+
+@tool
+def remember_preference(key: str, value: str, runtime: ToolRuntime) -> str:
+    """保存用户的偏好设置到长期记忆。
+
+    Args:
+        key: 偏好键名，如 'preferred_unit'、'home_city'
+        value: 偏好值
+    """
+    # 写入 store（跨会话持久）
+    # 注意：BaseStore 接口是异步的，但在同步工具中可用 put 的同步变体
+    namespace = ("user_prefs", runtime.context.get("user_id", "anonymous"))
+    runtime.store.put(namespace, key, value={"value": value})
+    runtime.stream_writer(f"已保存 {key} = {value}")
+
+    return f"偏好 '{key}' 已设置为 '{value}'，下次对话仍然有效。"
+
+
+@tool
+def recall_preference(key: str, runtime: ToolRuntime) -> str:
+    """从长期记忆中读取用户的偏好设置。
+
+    Args:
+        key: 偏好键名
+    """
+    namespace = ("user_prefs", runtime.context.get("user_id", "anonymous"))
+    result = runtime.store.get(namespace, key)
+
+    if result is None:
+        return f"未找到偏好 '{key}'，请先使用 remember_preference 保存。"
+
+    value = result.get("value", "未知")
+    return f"偏好 '{key}' 的值为 '{value}'。"
+```
+
+### 3.5 ToolRuntime 关键设计要点
+
+1. **参数名必须是 `runtime: ToolRuntime`**——框架按参数名匹配注入，其他名字不会被特殊处理。
+2. **自动隐藏**——LLM 看不到 `runtime` 参数，不会尝试填充它，不会污染 tool schema。
+3. **stream_writer 是回调式的**——写入内容会实时推送给前端（适用于进度条/日志场景），不影响工具返回值。
+4. **store 是异步接口**——在同步工具中调用同步变体即可，LangChain 内部会处理好事件循环。
+
+---
+
+## 四、工具执行与 Agent 整合：create_agent
+
+### 4.1 从 bind_tools 到 create_agent
+
+Week 02 Day 02 我们用了 `bind_tools` + 手写 while 循环管理工具调用。2026 年 LangChain 提供了更上层的 `create_agent`，把工具循环完全封装起来：
+
+```python
+"""tool_calling_demo.py — 第五部分：create_agent 整合"""
+from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
+
 model = init_chat_model("gpt-4o-mini", temperature=0)
 
-# 把三个工具绑上去
-tools = [get_weather, search_routes, calculate_distance]
-model_with_tools = model.bind_tools(tools)
+# 工具列表
+TOOLS = [get_weather, search_routes, calculate_distance, check_user_history]
 
-# 发一条需要工具的消息
-ai_msg: "AIMessage" = model_with_tools.invoke([
-    HumanMessage(content="北京今天多少度？顺便查一下北京有什么 easy 的徒步路线"),
-])
-
-print(type(ai_msg).__name__)     # AIMessage
-print(ai_msg.content)            # '' 或 None（调工具时通常不回文字）
-print(ai_msg.tool_calls)         # ← 关键：结构化的工具调用列表
-```
-
-### 3.2 AIMessage.tool_calls 的结构
-
-注意：LangChain 已经帮你把 Week 03 里那个 `json.loads(arguments)` 的坑填了——`args` 直接是 **dict**，不是字符串。
-
-```python
-# ai_msg.tool_calls 长这样（已经是结构化对象，无需再 json.loads）：
-[
-    {"name": "get_weather",     "args": {"city": "北京"},                       "id": "call_abc1"},
-    {"name": "search_routes",   "args": {"location": "北京", "difficulty": "easy"}, "id": "call_abc2"},
-]
-```
-
-| Week 03 手写 tool_calls | LangChain AIMessage.tool_calls |
-|------------------------|-------------------------------|
-| `tc["function"]["name"]` | `tc["name"]` |
-| `json.loads(tc["function"]["arguments"])`（字符串！） | `tc["args"]`（已是 dict） |
-| `tc["id"]` | `tc["id"]` |
-| 要自己判断 `finish_reason == "tool_calls"` | 直接看 `ai_msg.tool_calls` 是否非空 |
-
-### 3.3 tool_choice 参数
-
-`bind_tools` 的第二个参数 `tool_choice` 控制 LLM 何时调用工具，对应 Week 03 Day 02 讲过的四种模式：
-
-```python
-# auto（默认）：LLM 自己决定调不调
-model.bind_tools(tools, tool_choice="auto")
-
-# any / required：强制必须调至少一个工具
-model.bind_tools(tools, tool_choice="any")        # LangChain 通用写法
-# 注：OpenAI 原生用 "required"，LangChain 内部会做适配
-
-# none：禁止调用工具（即使绑了也无视）
-model.bind_tools(tools, tool_choice="none")
-
-# 指定工具：只能调这一个
-model.bind_tools(tools, tool_choice="get_weather")
-```
-
-| 模式 | 何时用 | Week 03 对应值 |
-|------|--------|---------------|
-| `"auto"` | 通用 Agent，让 LLM 自己判断 | `"auto"` |
-| `"any"` / `"required"` | 批量处理，强制每条都调工具 | `"required"` |
-| `"none"` | 纯对话模式 | `"none"` |
-| `"工具名"` | 路由模式，强制只调指定工具 | `{"type":"function","function":{"name":...}}` |
-
----
-
-## 四、ToolMessage 与完整工具循环
-
-### 4.1 为什么要 ToolMessage
-
-模型返回 `tool_calls` 只是"声明要调工具"，真正执行得我们自己来。执行完的结果必须用 `ToolMessage` 包起来回传，**且 `tool_call_id` 必须对上**——这一步和 Week 03 手写的 `{"role":"tool","tool_call_id":...}` 完全对应，只是换了 LangChain 的消息类。
-
-```python
-"""tool_calling_demo.py — 第四部分：ToolMessage 回传"""
-from langchain_core.messages import AIMessage, ToolMessage
-
-# 假设 ai_msg 是上一步带 tool_calls 的 AIMessage
-# 执行第一个工具调用，结果包成 ToolMessage
-tc = ai_msg.tool_calls[0]                      # {"name":"get_weather","args":{"city":"北京"},"id":"call_abc1"}
-result = get_weather.invoke(tc["args"])        # 直接用工具对象的 invoke，传入 args dict
-tool_msg = ToolMessage(
-    content=str(result),        # 工具执行结果，必须是字符串
-    tool_call_id=tc["id"],      # ← 必须对上 AIMessage 里那个 id，否则报错
+# 创建 Agent——三行搞定
+agent = create_agent(
+    model=model,
+    tools=TOOLS,
 )
 ```
 
-### 4.2 工具映射表 + 完整循环
+### 4.2 Agent 自动管理了什么
 
-把 Week 03 的 `TOOL_REGISTRY` 换成 `{tool.name: tool}` 的字典，循环逻辑保持"调模型 → 有 tool_calls 就执行 → 回传 → 再调"的四步。今天还**不用 LangGraph**，纯 while 循环——这正是 Day 04 要用 StateGraph 替换的部分。
+对比 Week 03 手写 vs `create_agent`：
+
+| 环节 | Week 03 手写（约 80 行） | create_agent（1 行） |
+|------|------------------------|---------------------|
+| 绑定工具 | 每次请求写 `body["tools"] = TOOLS` | `tools=TOOLS` 传参 |
+| tool_choice 解析 | 手动判断 `finish_reason` | 自动根据 `tool_calls` 字段判读 |
+| 工具 dispatch | 查 `TOOL_REGISTRY` + `**kwargs` | 框架用 `{tool.name: tool}` 自动映射 |
+| 结果打包 | 手动 `ToolMessage(content=..., tool_call_id=...)` | 自动产出 ToolMessage |
+| 消息回填 | 手动 append AIMessage + ToolMessage | 自动保障消息顺序 |
+| 循环终止 | 手写 `max_iter` + while break | 内置 `max_iterations` 参数 |
+| 错误处理 | 手动 try/except 每个工具 | 工具内异常自动字符串化回传 |
+
+### 4.3 调用 Agent
 
 ```python
-"""tool_calling_demo.py — 第五部分：完整工具循环（纯 LangChain，不用图）"""
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+# invoke 时传入 messages 列表 + thread_id
+response = agent.invoke(
+    {"messages": [("human", "北京今天天气如何？顺便查一下北京有什么 easy 的徒步路线。")]},
+    config={"configurable": {"thread_id": "thread-001"}},
+)
 
-# 工具名 → 工具对象的映射（替代 Week 03 的 TOOL_REGISTRY）
-TOOLS = [get_weather, search_routes, calculate_distance]
-TOOL_MAP = {t.name: t for t in TOOLS}
-
-model = init_chat_model("gpt-4o-mini", temperature=0)
-model_with_tools = model.bind_tools(TOOLS)
-
-
-def run_agent(user_input: str, max_iter: int = 5) -> str:
-    """
-    手写工具循环：调模型 → 解析 tool_calls → 执行 → ToolMessage 回传 → 再调。
-
-    这就是 Week 03 的 while True 循环，只是消息类型换成了 LangChain 的 Message 类。
-    Day 04 会用 LangGraph 的条件边把这个 while 变成图。
-    """
-    messages = [
-        SystemMessage(content="你是一个徒步出行助手，可以查天气、检索路线、算距离。"),
-        HumanMessage(content=user_input),
-    ]
-
-    for i in range(max_iter):
-        # ① 调用带工具的模型
-        ai_msg = model_with_tools.invoke(messages)
-        messages.append(ai_msg)                          # ← 关键：assistant 消息必须回填
-
-        # ② 没有 tool_calls → 模型已给出最终回答，退出循环
-        if not ai_msg.tool_calls:
-            return ai_msg.content
-
-        # ③ 有 tool_calls → 逐个执行，结果包成 ToolMessage 回传
-        print(f"[iter {i+1}] 模型请求调用 {len(ai_msg.tool_calls)} 个工具")
-        for tc in ai_msg.tool_calls:
-            tool_obj = TOOL_MAP.get(tc["name"])
-            if tool_obj is None:
-                content = f"错误：未知工具 '{tc['name']}'"
-            else:
-                try:
-                    content = str(tool_obj.invoke(tc["args"]))
-                except Exception as e:
-                    content = f"工具执行异常：{e}"       # 错误也字符串化回传，让 LLM 自己应对
-            messages.append(ToolMessage(content=content, tool_call_id=tc["id"]))
-            print(f"   - {tc['name']}({tc['args']}) => {content[:40]}")
-        # ④ 循环回到 ①，带着工具结果再调一次模型
-
-    return "达到最大轮数，强制停止"
-
-
-if __name__ == "__main__":
-    print(run_agent("我想从北京去上海徒步，帮我查北京和上海的天气，再算两地距离"))
+# 在 ToolRuntime 中通过 context 传入用户 ID 等上下文
+response = agent.invoke(
+    {"messages": [("human", "帮我查一下我的历史记录。")]},
+    config={
+        "configurable": {
+            "thread_id": "thread-001",
+            "user_id": "user_zhang_01",      # ← 自动注入到 runtime.context
+            "session_id": "session_abc123",
+        }
+    },
+)
 ```
 
-### 4.3 消息流对照
+### 4.4 对比 Week 03：40 行 vs 3 行
 
-这个循环的消息演化过程和 Week 03 一模一样，只是类型从 dict 换成了 Message 对象：
+```python
+# ── Week 03 手写：约 40 行样板 ──
+def run_week03_agent(user_input: str) -> str:
+    messages = [{"role": "user", "content": user_input}]
+    for _ in range(5):
+        response = httpx.post(URL, headers=HEADERS, json={
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "tools": TOOL_SCHEMAS,
+        }).json()
+        msg = response["choices"][0]["message"]
+        if msg.get("finish_reason") != "tool_calls":
+            return msg["content"]
+        messages.append({"role": "assistant", "content": msg.get("content", "")})
+        for tc in msg["tool_calls"]:
+            name, args = tc["function"]["name"], json.loads(tc["function"]["arguments"])
+            result = TOOL_REGISTRY[name](**args)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+    return "达到最大轮数"
 
+# ── Week 06 create_agent：约 3 行 ──
+agent = create_agent(model=model, tools=TOOLS)
+response = agent.invoke(
+    {"messages": [("human", user_input)]},
+    config={"configurable": {"thread_id": "thread-001"}},
+)
 ```
-回合开始: [System, Human]
 
-① invoke → AIMessage(tool_calls=[w, r])
-   messages: [System, Human, AIMessage(tool_calls)]
-
-② 执行 w → ToolMessage(id=w)
-   执行 r → ToolMessage(id=r)
-   messages: [System, Human, AIMessage(tool_calls), ToolMsg_w, ToolMsg_r]
-
-③ 再 invoke → AIMessage(content="最终回答", tool_calls=[])
-   messages: [..., AIMessage(回答)]   ← tool_calls 为空，循环退出
-```
-
-> 关键不变量：**带 tool_calls 的 AIMessage 必须先回填，再接 ToolMessage**。顺序错了（ToolMessage 在 AIMessage 前面）OpenAI 直接 422。这条 Week 03 踩过的坑，LangChain 不替你兜底——它只是把消息包装成了对象，顺序还得你自己保证。
+**关键在于**：`create_agent` 没有改变底层逻辑——它仍然是"调模型→解析 tool_calls→执行→回传→再调"的循环。它只是把这个循环从你的代码里搬进了框架里。理解了这个底层，你才不会被框架的抽象困住。
 
 ---
 
-## 五、工具设计原则回顾：@tool 落实了哪几条
+## 五、工具设计原则重申
 
-Week 03 Day 05 提了工具六原则。现在回头看，`@tool` 帮我们自动落了哪几条，哪几条还得自己写。
+### 5.1 @tool 自动落实 vs 仍需手写
 
-| 原则 | @tool 是否自动落实 | 说明 |
-|------|------------------|------|
-| 1. 单一职责 | 否 | 装饰器不管你函数干几件事，得自己拆 |
-| 2. 清晰触发条件（description） | **半自动** | docstring 自动变成 description，但写不写清楚是你的事 |
+| Week 03 Day 05 六原则 | @tool 是否自动落实 | 说明 |
+|----------------------|------------------|------|
+| 1. 单一职责 | 否 | 装饰器不管函数干几件事，得自己拆分 |
+| 2. 清晰 description | **半自动** | docstring 自动变 `description`，但写不写清楚是你的事 |
 | 3. 好参数名 | 否 | 形参名直接当 schema 参数名，命名好坏全看你 |
-| 4. 默认值 | **自动** | Python 默认值 `unit="celsius"` 自动标成可选参数 |
-| 5. 错误处理 | 否 | 工具函数内部的 try/except 还得自己写 |
+| 4. 默认值 | **自动** | Python 默认值自动标为可选参数 |
+| 5. 错误处理 | 否 | 函数内 try/except 还得自己写 |
 | 6. 幂等性 | 否 | 装饰器不区分读/写操作，副作用得自己控 |
 
-### 5.1 好工具 vs 坏工具（@tool 版）
+### 5.2 好工具 vs 坏工具对比表
 
 ```python
-# ── ❌ 坏工具：docstring 敷衍，参数缩写，没有错误处理 ──
+# ── ❌ 坏工具：docstring 敷衍、参数缩写、无错误处理 ──
 @tool
 def search(q: str) -> str:
     """搜索"""
     resp = httpx.get(f"https://api.example.com/search?q={q}")  # 无超时、无异常处理
     return resp.text
 
-# 问题：description 只有"搜索"两个字 → LLM 不知道何时用；
+# 问题：description 只有"搜索"→ LLM 不知道何时用；
 #       参数名 q 有歧义；网络调用无 try/except → 一超时整个 Agent 崩
 
 
-# ── ✅ 好工具：docstring 写场景，参数全称，内部 try/except ──
+# ── ✅ 好工具：docstring 写场景、参数全称、内部 try/except ──
 @tool
 def search_web(query: str, max_results: int = 5) -> str:
     """搜索互联网获取最新信息。当用户问实时新闻、最新文档、或模型训练数据
@@ -393,46 +446,63 @@ def search_web(query: str, max_results: int = 5) -> str:
             resp.raise_for_status()
             return resp.text[:5000]                      # 限制返回长度，防爆 context
     except httpx.TimeoutException:
-        return "错误：搜索超时，建议简化查询词后重试"      # 错误也回传给 LLM
+        return "错误：搜索超时，建议简化查询词后重试"
     except Exception as e:
         return f"错误：{e}"
 ```
 
-### 5.2 @tool 的额外能力
+### 5.3 好工具 vs 坏工具对照
 
-除了自动生成 schema，`@tool` 还顺手解决了 Week 03 的几个老问题：
-
-- **自动注册**：装饰完就是 `BaseTool` 对象，直接丢进 `tools` 列表，不用手动维护注册表。
-- **统一调用接口**：`tool.invoke(args_dict)` 是所有工具的统一入口，dispatch 逻辑被收敛进框架。
-- **直接转 ToolMessage**：`tool.invoke` 在 AgentExecutor 等高层封装里会自动产出 ToolMessage，今天手写循环我们手动包，是为了看清底层。
-- **可组合**：工具本身是 Runnable，能和 LCEL 链拼起来（Day 01 的 `|` 管道）。
+| 维度 | 好工具 | 坏工具 |
+|------|--------|--------|
+| **docstring** | 写清楚"什么场景调用 + 每个参数的含义" | 敷衍或缺失 |
+| **参数名** | 全称、自解释（`query` / `max_results`） | 缩写（`q` / `n`） |
+| **类型注解** | 完整标注 `: str / : int` | 缺注解或只用 `: Any` |
+| **错误处理** | try/except 捕获 + 字符串化回传 | 裸奔，异常直接抛到顶层 |
+| **返回值约束** | 返回短文本（< 5000 字符），防爆 context | 返回长文档或 None |
+| **Pydantic 约束** | 枚举/范围用 `Field(enum=, ge=, le=)` | 纯字符串靠 LLM 猜 |
 
 ---
 
 ## 动手实验
 
-### 🟢 青铜级：跑通 `tool_calling_demo.py`
+### 🟢 青铜级：用 @tool 定义 + ToolRuntime 读取状态
 
-把上面五个部分的代码拼成一个可运行文件，跑 `run_agent("我想从北京去上海徒步...")`，观察终端打印的 `[iter N] 模型请求调用 X 个工具` 日志，确认你看到了"调模型→执行工具→回传→再调模型给最终回答"的完整两轮。把输出贴到笔记里。
+1. 打开 `tool_calling_demo.py`，把本文第二、三部分的 `get_weather`、`search_routes`、`check_user_history` 三个工具定义完整抄进去。
+2. 在文件末尾加一段测试代码，分别打印每个工具的 `name`、`description`、`args`。
+3. 特别注意 `check_user_history` 打印出的 `args` 里**没有** `runtime` 参数——验证它被自动隐藏了。
 
-### 🟡 白银级：加一个工具并测 tool_choice
+```python
+if __name__ == "__main__":
+    for t in [get_weather, search_routes, check_user_history]:
+        print(f"=== {t.name} ===")
+        print(f"  description: {t.description[:60]}...")
+        print(f"  args: {t.args}")
+```
 
-自己用 `@tool` 写一个 `send_email(to: str, subject: str, body: str)` 工具（模拟即可，不真发），绑到模型上。然后用三种 `tool_choice` 各调一次同一条消息"帮我给 alice@example.com 发封问候邮件"：
-- `"auto"`：观察 LLM 是否调工具
-- `"any"`：观察是否强制调了
-- `"send_email"`：观察是否只调了这一个
+### 🟡 白银级：用 create_agent 跑通完整对话
 
-记录三者的 `ai_msg.tool_calls` 差异。
+1. 把第四部分的 `create_agent` 代码加到 `tool_calling_demo.py`，用 `get_weather` + `search_routes` 两个工具创建 Agent。
+2. 调用 `agent.invoke({"messages": [...],}, config={"configurable": {"thread_id": "t1"}})`，输入 "北京今天天气如何？顺便帮我查北京有什么 easy 的徒步路线。"。
+3. 观察返回结果，确认 Agent 自动完成了两次工具调用并给出综合回答。
+4. （可选）加上 `check_user_history` 工具，在 `configurable` 里传入 `user_id` 和 `session_id`，验证 `runtime.context` 能读到这些值。
 
-### 🔴 王者级：手写多轮链式调用
+### 🔴 王者级：用 ToolRuntime 构建"带记忆的 Agent"
 
-构造一个需要**链式工具调用**的提问，比如"查北京天气，如果低于 20 度就再查北京有什么 easy 路线，最后算北京到上海的距离"。让你的 `run_agent` 循环跑出 2 轮以上的工具调用（第一轮查天气，第二轮根据天气结果决定是否查路线）。思考：纯 while 循环处理这种"依赖前一步结果"的链式调用，代码已经开始变绕了——这正是 Day 04 LangGraph 条件边要解决的问题，提前感受一下痛点。
+1. 编写一个完整脚本 `memory_agent.py`，包含三个工具：
+   - `remember_preference(key, value)`：用 `runtime.store` 写入长期记忆
+   - `recall_preference(key)`：用 `runtime.store` 读取长期记忆
+   - `get_weather(city, unit)`：查天气
+2. 用 `create_agent` 创建 Agent，**在第一次 invoke 中存偏好**，**在第二次 invoke（同一 thread_id）中读偏好**。
+3. 验证第二次对话时 Agent 能正确 recall 用户的单位偏好（比如用户说"用华氏度"，第二次查天气自动用了 Fahrenheit）。
+
+> 这个实验充分体现了 ToolRuntime 的价值：手写时代你用全局变量存记忆，会话间会丢失；用文件存又得自己处理序列化。`runtime.store` 把"跨会话持久化"抽象成了一行 `put` / `get`。
 
 ---
 
 ## 踩坑记录 🕳️
 
-### 坑 1：@tool 的函数没写 docstring → description 为空
+### 坑 1：@tool 忘写 docstring → description 为空 → LLM 不调
 
 ```python
 @tool
@@ -440,107 +510,110 @@ def get_weather(city: str) -> str:
     # 没有 docstring！
     return f"{city} 25°C"
 
-print(get_weather.description)   # ''  ← 空字符串
-# 结果：LLM 根本不知道这个工具干嘛的，几乎不会调用它
+print(get_weather.description)   # '' ← 空字符串
+# 结果：LLM 根本不知道这个工具干嘛的，几乎不会调用
 ```
 
-**解决**：`@tool` 的 description 完全来自 docstring，没 docstring 等于没 description。每个工具函数第一行必须写清楚"这是什么工具、什么时候用"。呼应 Week 03 day05 原则 2。
+**解决**：每个 `@tool` 函数第一行必须写 docstring，至少一句"这是什么工具、什么时候用"。没有 docstring = 没有 description = LLM 不会调。
 
-### 坑 2：把 args 当字符串处理（Week 03 的肌肉记忆）
-
-```python
-# ❌ Week 03 的老习惯，在 LangChain 里会报错
-import json
-args = json.loads(tc["args"])    # TypeError: the JSON object must be str...
-city = args["city"]
-
-# ✅ LangChain 的 tool_calls["args"] 已经是 dict
-city = tc["args"]["city"]
-```
-
-**解决**：Week 03 里 `arguments` 是 JSON 字符串必须 `json.loads`；LangChain 已经帮你解析好了，`tc["args"]` 直接就是 dict。换框架时要改掉这个肌肉记忆。
-
-### 坑 3：ToolMessage 的 tool_call_id 对不上
-
-```python
-# ❌ id 拼错或忘了传
-ToolMessage(content="北京 25°C")                       # 没有 tool_call_id
-ToolMessage(content="北京 25°C", tool_call_id="wrong") # 和 AIMessage 里的 id 对不上
-# 结果：OpenAI API 报 400 "tool_call_ids must match previous tool_calls"
-```
-
-**解决**：每个 ToolMessage 的 `tool_call_id` 必须严格等于对应 `ai_msg.tool_calls[i]["id"]`。循环里直接用 `tc["id"]` 传进去，别手写 id。
-
-### 坑 4：忘记把带 tool_calls 的 AIMessage 回填到 messages
-
-```python
-# ❌ 只 append ToolMessage，不 append AIMessage
-for tc in ai_msg.tool_calls:
-    messages.append(ToolMessage(content=..., tool_call_id=tc["id"]))
-# 再 invoke 时 LLM 困惑：这些 ToolMessage 是谁调的？→ 报错或乱答
-
-# ✅ 先 append AIMessage，再 append ToolMessage
-messages.append(ai_msg)
-for tc in ai_msg.tool_calls:
-    messages.append(ToolMessage(content=..., tool_call_id=tc["id"]))
-```
-
-**解决**：消息顺序必须是 `AIMessage(tool_calls) → ToolMessage → ToolMessage → ...`。这条 Week 03 Day 02 坑 4 已经踩过，换了框架坑还在——LangChain 只包装消息类型，不替你管顺序。
-
-### 坑 5：工具返回 None 或非字符串
+### 坑 2：ToolRuntime 参数名写错或漏类型注解
 
 ```python
 @tool
-def get_weather(city: str) -> dict:           # 返回类型标了 dict
-    return {"city": city, "temp": 25}          # 返回 dict
+def check_history(query: str, runtime):          # ❌ 少了类型注解 : ToolRuntime
+    ...
 
-# ToolMessage(content=result) 时 content 不是 str → 序列化/解析出问题
+@tool
+def check_history(query: str, ctx: ToolRuntime): # ❌ 参数名必须是 runtime，不是 ctx
+    ...
 ```
 
-**解决**：`ToolMessage.content` 必须是字符串。工具函数要么返回 `str`，要么在包 ToolMessage 前 `str(result)` / `json.dumps(result, ensure_ascii=False)`。复杂结构建议返回 JSON 字符串，让 LLM 自己解析。
+**解决**：参数名**必须**是 `runtime`，类型注解**必须**是 `: ToolRuntime`。名字错了框架不会注入（当成普通参数暴露给 LLM）；类型错了 IDE 不会提示但框架能通过 `inspect` 匹配。
+
+### 坑 3：在同步工具里直接 await store 的异步方法
+
+```python
+@tool
+def save_pref(key: str, value: str, runtime: ToolRuntime) -> str:
+    # ❌ 同步函数里不能直接 await
+    await runtime.store.aput(...)   # SyntaxError: 'await' outside function
+```
+
+**解决**：用同步变体 `runtime.store.put(namespace, key, value=...)`。LangChain 的 `BaseStore` 同时提供了同步和异步接口，同步工具里调同步方法即可。
+
+### 坑 4：stream_writer 写了太多内容，把输出淹了
+
+```python
+@tool
+def long_task(runtime: ToolRuntime) -> str:
+    for i in range(100):
+        runtime.stream_writer(f"进度: {i}%")  # 前端会被刷屏
+    return "完成"
+```
+
+**解决**：`stream_writer` 适合写"关键里程碑"而不是"每一步"。建议只在关键节点（开始、完成、错误）或每 10% 写一次，避免高频刷新。
+
+### 坑 5：create_agent 的 configurable 和 context 混用
+
+```python
+# ❌ 以为 configurable 的参数会自动变成 runtime.context
+agent.invoke(..., config={"configurable": {"my_key": "val"}})
+# 结果：runtime.context 里没有 my_key
+
+# ✅ 需要在创建 Agent 时设置 context 映射，或使用更高层的 AgentExecutor
+from langchain.agents import create_agent, AgentExecutor
+executor = AgentExecutor(agent=agent, tools=TOOLS)
+response = executor.invoke(
+    {"input": "..."},
+    config={"configurable": {"user_id": "zhang_01"}},
+)
+# ToolRuntime 的 context 来自 AgentExecutor 的 config
+```
+
+**解决**：`runtime.context` 需要 Agent 执行器（`AgentExecutor`）正确传递。直接用 `create_agent` 返回的对象 invoke 时，configurable 并不会全部注入 context。推荐用 `AgentExecutor` 封装一层。
 
 ---
 
 ## 副线笔记：对比 Week 03 手写 Function Calling
 
-今天的主线是把 Week 03 Day 02 手写的 Function Calling 换成 LangChain 写法。两套代码做的是**完全一样的事**，差别只在工程量。这正是 Week 06 开篇说的"手写过，所以用框架不是黑盒"。
+### 12 维度详细对比表
 
-### 详细对比表
+| 维度 | Week 03 手写 | Week 06 @tool + ToolRuntime |
+|------|-------------|----------------------------|
+| **1. Schema 定义** | 手写 20+ 行 JSON Schema | `@tool` + 类型注解自动生成 |
+| **2. 参数约束** | JSON Schema 的 `enum` / `required` / `minimum` | Pydantic `Field(enum=, ge=, le=)` |
+| **3. tool_calls 解析** | `json.loads(tc["function"]["arguments"])` 字符串->dict | `tc["args"]` 已是 dict，无需手动解析 |
+| **4. 工具注册** | 手动维护 `TOOL_REGISTRY[name] = func` | 装饰器自动注册，`tools = [t1, t2]` 直接用 |
+| **5. 绑定到模型** | 每次请求手动构造 `body["tools"] = TOOL_SCHEMAS` | `create_agent(model=model, tools=TOOLS)` 一次绑定 |
+| **6. 结果回传格式** | 手动构造 `{"role":"tool","tool_call_id":...,"content":...}` 字典 | 框架自动产出 `ToolMessage` |
+| **7. 消息顺序保障** | 手写 ensure AIMessage(tool_calls) 在 ToolMessage 之前 | 框架自动保障 |
+| **8. 工具循环控制** | 手写 `while` + `max_iter` + `break` | `create_agent` 内置 `max_iterations` 参数 |
+| **9. 状态访问** | 不可能——手写时代没有"Agent 状态"的概念 | `runtime.state["messages"]` 直接读取 |
+| **10. 运行时上下文** | 只能通过闭包或全局变量传用户 ID | `runtime.context` 自动注入 |
+| **11. 长期记忆** | 需要自己实现文件/数据库持久化 | `runtime.store` 一行 `put` / `get` |
+| **12. 流式输出** | 不可能——同步返回后才拿到完整结果 | `runtime.stream_writer("进度...")` 实时推送 |
+| **单工具代码量** | 约 30 行（Schema + impl + 注册） | 约 5-8 行（@tool + impl） |
+| **完整 Agent 代码** | 约 80-120 行 | 约 10 行 |
 
-| 维度 | Week 03 手写 | Week 06 LangChain |
-|------|-------------|-------------------|
-| **schema 定义** | 手写 20+ 行 JSON Schema 字典 | `@tool` 装饰函数，从 docstring + 注解自动生成 |
-| **参数约束** | JSON Schema 的 enum/required | 类型注解 + Pydantic `Field(enum=, ge=, le=)` |
-| **工具注册** | 手动 `TOOL_REGISTRY[name] = func` | 装饰器自动注册，`tools = [t1, t2]` 直接用 |
-| **绑定到模型** | 每次请求 `body["tools"] = TOOLS` | `model.bind_tools(tools)` 一次，返回带工具的 Runnable |
-| **tool_calls 解析** | `tc["function"]["name"]` + `json.loads(tc["function"]["arguments"])` | `tc["name"]` + `tc["args"]`（已是 dict） |
-| **是否调工具判断** | `finish_reason == "tool_calls"` | `ai_msg.tool_calls` 是否非空 |
-| **结果回传格式** | `{"role":"tool","tool_call_id":...,"content":...}` | `ToolMessage(content=..., tool_call_id=...)` |
-| **错误处理** | 自己 try/except + 字符串化 | 同样自己写，但错误字符串回传的模式一致 |
-| **tool_choice** | 请求体里 `"tool_choice": "auto"` | `bind_tools(..., tool_choice="auto")` |
-| **单工具代码量** | 约 30 行（schema + impl + 注册） | 约 5 行（@tool + impl） |
-| **完整循环代码量** | 约 80 行 | 约 30 行 |
-| **底层逻辑** | 手写裸 HTTP + JSON | 框架封装，但消息顺序、id 匹配仍需自己保证 |
+### 结论：50 行压到 10 行，底层逻辑没变
 
-### 结论：50 行压到 10 行，但底层没变
+对比表的前 8 行是"量的变化"——LangChain 把约 50 行的样板代码压到约 10 行。但第 9-12 行是"质的变化"——`ToolRuntime` 提供了手写时代**根本做不到**的能力：工具函数能直接读取 Agent 状态、能接收调用上下文、能访问跨会话持久存储、能实时推送进度。
 
-LangChain 把 Week 03 那套**约 50 行的工具定义+注册+解析样板代码**压到了**约 10 行**（`@tool` + `bind_tools` + `ToolMessage`）。但仔细看对比表会发现：**底层逻辑一行没变**——还是要解析 tool_calls、还是要按顺序回填消息、还是 tool_call_id 必须对上、还是要 try/except 处理工具异常、还是 max_iter 防死循环。LangChain 帮你省的是"重复的样板"，省不了的是"对机制的理解"。
+这是 LangChain 2026 年工具系统最核心的设计进化：**把工具从"纯函数"升级为"有状态运行时的一等公民"**。
 
-这就是手写的价值：当你今天看到 `ToolMessage(content=..., tool_call_id=...)` 时，你脑子里会自动浮现 Week 03 那个 `{"role":"tool","tool_call_id":...,"content":...}` 字典——你**知道这一行在干什么**，而不是把它当成一个黑盒 API 调用。等 Day 04 LangGraph 把这个 while 循环再抽象成"条件边 + 节点"时，你同样能看穿：图的循环边就是 `while True`，节点就是循环体里的几行代码。
-
-> 一句话：**框架是站在手写的肩膀上的糖，不是替代品。** 手写过的人吃糖知道甜在哪，没手写过的人吃糖只知道甜、不知道为什么甜。
+但底层的消息循环逻辑没变——"模型返回 tool_calls → 执行 → 回传 ToolMessage → 再调模型"这条流水线，不管是手写 80 行还是框架 10 行，它都在。理解它，框架就是你的工具而不是黑盒。
 
 ---
 
 ## 今日产出检查清单
 
-- [ ] 用 `@tool` 定义了 3 个工具（get_weather / search_routes / calculate_distance），并能打印出自动生成的 `name / description / args`
-- [ ] 用 `model.bind_tools(...)` 绑定工具，成功拿到带 `tool_calls` 的 `AIMessage`，确认 `args` 已是 dict
-- [ ] 手写了完整的 `run_agent` 工具循环（解析 → 执行 → ToolMessage 回传 → 再调），跑通至少一个两轮调用的例子
-- [ ] 测过至少两种 `tool_choice`（auto / any 或指定工具），观察调用行为差异
-- [ ] 能对照表格说出 @tool 自动落实了六原则的哪几条、哪几条还得自己写
-- [ ] 产出文件 `tool_calling_demo.py` 可独立运行（无 API key 时至少能跑模拟模式）
+- [ ] 用 `@tool` 定义至少 3 个工具，能打印出 `name` / `description` / `args`，且确认 `runtime` 参数不在 `args` 中
+- [ ] 用 `ToolRuntime` 在工具中访问 `runtime.state`、`runtime.context`、`runtime.stream_writer`，并验证 `stream_writer` 输出能在终端或前端看到
+- [ ] 用 `create_agent(model=model, tools=TOOLS)` 创建 Agent 并跑通一个包含多工具调用的对话
+- [ ] 在 `configurable` 中传入 `user_id` 和 `session_id`，在工具中通过 `runtime.context` 读取到它们
+- [ ] 能用 12 维度对比表说清 Week 03 手写 vs Week 06 @tool + ToolRuntime 的差异
+- [ ] 产出文件 `tool_calling_demo.py` 包含 @tool 定义、ToolRuntime 示例、create_agent 整合三部分
 
 ---
 
-> **下一课预告：Day 03 — LangGraph 入门：StateGraph / Node / Edge**。今天我们用 LangChain 手写了一个 while 工具循环，逻辑清楚了但代码已经开始绕——链式调用、条件分支都得自己 if/else 拼接。明天请出 LangGraph：用 `StateGraph` 把"状态"显式化，用"Node"把每一步变成函数节点，用"Edge"把控制流变成边，把今天的 while 循环重写成一张图。你会发现，图不过是把循环的每一行拍平成节点和边而已。
+> **下一课预告：Day 03 — LangGraph 入门：StateGraph / Node / Edge**。今天我们用 @tool 和 ToolRuntime 把工具的定义和执行升级了，但控制流还靠 create_agent 的内部循环。明天请出 LangGraph：用 `StateGraph` 显式定义状态，用 `Node` 表达每个步骤（调用模型 / 执行工具），用 `Edge` 表达条件分支，把 Agent 循环从"隐式 while"变成"显式图"。你会发现，图不过是把循环的每一行拍平成节点和边——但一旦拍平，复杂控制流的设计和调试就变得无比清晰。

@@ -1,51 +1,81 @@
-# Day 01 — LangChain 基础：模型 / Prompt / LCEL
+# Day 01 — LangChain 基础：模型 / create_agent / 工具
 
 ## 学习目标
 
-Week 03 我们用 httpx 裸调过 LLM API：手拼 messages、手写 SSE 流式解析、手写 `extract_usage` 兼容 OpenAI/Anthropic 两套 usage 字段。那一套能跑，但每换个模型、加段历史、要个结构化输出，都得改一大片代码。今天正式引入 LangChain 框架：用统一的模型抽象屏蔽各家 API 差异，用 Prompt 模板替代 f-string 拼接，用 LCEL 管道符把"拼 prompt → 调模型 → 解析输出"串成一条链。目标是把 Week 03 手写的 httpx 调用换成 LangChain 的框架写法，且因为你手写过底层，所以每用一层抽象都知道它在替你干什么。
+Week 03 我们用 httpx 手写过完整的 Agent Loop：手动拼 messages、手动调 API、手动解析 tool_calls、手动 while 循环处理多轮工具调用。那套代码能跑，但每加一个工具、每换一个模型、每想加个记忆功能，都得动底层循环逻辑。今天正式引入 2026 年 LangChain 的推荐 API——`create_agent()`，它把模型、工具、持久化、结构化输出全部封装成一行调用，底层自动用 LangGraph 管理 Agent 循环。同时你也要学会 `init_chat_model` 统一模型接口和 LCEL 管道链，这两者分别是 `create_agent` 的组件基础和理解框架的入口。
 
 学完今天你能：
-1. 用 `init_chat_model` 一个函数对接 OpenAI / Anthropic / Ollama，并在 `invoke / stream / batch` 三种调用方式间无缝切换
-2. 用 `ChatPromptTemplate` + `MessagesPlaceholder` 替代手拼 messages list，把多轮对话历史模板化
-3. 用 LCEL 管道符 `prompt | model | parser` 组装链，并说清楚它本质是 `Runnable.pipe()`，自动支持流式、批量、异步
-4. 用 `PydanticOutputParser`（以及 `with_structured_output`）把 Week 03 手写的 JSON 解析 + Pydantic 校验交给框架
+1. 说清楚 `create_agent()` 的一行调用替代了 Week 03 手写 Agent Loop 里的哪些环节
+2. 用 `init_chat_model` 一个函数对接 Ollama / OpenAI / Anthropic，在 `invoke / stream / batch` 间无缝切换
+3. 用 `create_agent(model, tools, system_prompt)` 一行创建 Agent，并用 `thread_id` 管理多轮对话会话
+4. 区分什么时候用 `create_agent`（需要工具循环），什么时候用 LCEL 简单链（纯推理，无需工具）
 
 ---
 
-## 一、为什么用 LangChain：回顾 Week 03 手写 httpx 的痛点
+## 一、为什么用 LangChain：回顾 Week 03 手写 Agent 的痛点
 
 ### 1.1 Week 03 我们写过什么
 
-Week 03 的 `api_client.py` 里，调一个 LLM 要干这些事：手动拼 `headers`（OpenAI 用 `Authorization: Bearer`，Anthropic 用 `x-api-key`）、手动拼 `payload`（字段名都不一样）、手动 `httpx.post`、手动 `raise_for_status`、手动从 `choices[0].message.content` 里抠文本、流式还得自己按行解析 `data: {...}` 直到遇到 `[DONE]`。结构化输出那一版更繁琐：手动把 Pydantic schema 转成 tools、手动从 `tool_calls[0].function.arguments` 里取 JSON 再 `json.loads`。
+Week 03 你写过两个关键模块：`api_client.py`（手调 LLM API）和 `agent_loop.py`（手写 Tool Calling + while 循环）。
 
-这一套能让你看清 LLM API 的底裤，但它有三个痛点会随项目变大而爆发。
+`api_client.py` 里，调一个 LLM 要手动拼 headers、手动拼 payload、手动 `httpx.post`、手动从 `choices[0].message.content` 抠文本、流式还得自己按行解析 SSE 直到 `[DONE]`。结构化输出更繁琐：手动把 Pydantic schema 转成 tools、手动从 `tool_calls[0].function.arguments` 里取 JSON 再 `json.loads`。
 
-### 1.2 三大痛点
+`agent_loop.py` 里，Agent 循环是这样写的：
 
-| 痛点 | Week 03 手写 httpx 的表现 | 后果 |
-|------|--------------------------|------|
-| **模型切换要改代码** | OpenAI 和 Anthropic 是两套 headers、两套 payload、两套 usage 字段，`call_llm` 和 `call_llm_anthropic` 是两个函数 | 换个模型供应商要改调用层，A/B 测试模型几乎不可能 |
-| **Prompt 拼接繁琐** | 多轮对话要手动 `messages.append({"role": ..., "content": ...})`，f-string 拼系统提示和用户输入混在一起 | 历史一长 messages list 难维护，模板复用靠复制粘贴 |
-| **输出解析手写** | JSON Mode 要 `json.loads(content)`，Function Calling 要抠 `tool_calls[0].function.arguments`，还要自己接 Pydantic 校验 | 每种结构化输出写一遍解析，错误处理全靠 try/except 兜 |
+```python
+messages = [{"role": "system", "content": "你是一个助手"}]
+messages.append({"role": "user", "content": user_input})
+
+while True:
+    resp = call_llm(messages)                 # 调 API
+    msg = resp["choices"][0]["message"]
+    messages.append(msg)
+
+    if not msg.get("tool_calls"):
+        break                                  # 没有工具调用 → 输出文本，结束
+
+    for tc in msg["tool_calls"]:
+        func_name = tc["function"]["name"]
+        args = json.loads(tc["function"]["arguments"])
+        result = execute_tool(func_name, args)  # 执行工具
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": json.dumps(result, ensure_ascii=False),
+        })
+    # 继续循环交给模型处理工具结果
+```
+
+这一段能让你看清 Agent 的本质——LLM 思考 → 决定调工具 → 执行 → 把结果给 LLM → 直到 LLM 给出最终文本。但它的问题会随项目变大而爆发。
+
+### 1.2 四大痛点
+
+| 痛点 | Week 03 手写的表现 | 后果 |
+|------|--------------------|------|
+| **模型切换改大段代码** | OpenAI 和 Anthropic 两套 headers/payload，agent_loop 和 api_client 深度耦合 | 换模型供应商要重写循环逻辑 |
+| **工具绑定手写** | 手动构造 tools JSON Schema，手动 dispatch tool name → function | 加一个工具要在三处改代码 |
+| **多轮对话无状态** | 每次对话 messages 列表在内存里，关掉就丢；要持久化得手写 json.dump | 无法实现跨轮对话的会话隔离 |
+| **缺少中间件层** | 没有 Callback / 没有 Retry / 没有 Token 计数 / 没有日志 | 出问题只能加 print 调试 |
 
 ### 1.3 LangChain 解决什么
 
-LangChain 不提供 LLM（LLM 还是 OpenAI / Anthropic / Ollama 那些），它做的是**集成抽象**：把"调用不同模型 + 拼 prompt + 解析输出"这三件每次都要重写的事，封装成可复用、可组合的组件。你写的不再是"调 DeepSeek 的 httpx 代码"，而是"调一个 ChatModel"——底下接谁由配置决定。
+LangChain 不提供 LLM（LLM 还是 OpenAI / Anthropic / Ollama 那些），它做的是**集成抽象**：把"调用不同模型 + 绑定工具 + 管理 Agent 循环 + 持久化"封装成可复用、可组合的组件。而 2026 年官方推荐的 `create_agent()` 则进一步把整个 Agent 循环封装成一行。
 
-| 维度 | Week 03 手写 httpx | LangChain 框架写法 |
-|------|--------------------|--------------------|
-| 切换模型 | 改函数、改 headers、改 payload 解析 | 改一个 `model_provider` 字符串 |
-| Prompt 组织 | 手拼 messages list | `ChatPromptTemplate` 模板变量 |
-| 流式输出 | 手写 SSE 行解析 + `[DONE]` 判断 | `chain.stream()` 逐块 yield |
-| 批量调用 | 自己写循环 + 并发 | `chain.batch([...])` 一次传多个 |
-| 结构化输出 | 手抠 JSON + 手接 Pydantic | `PydanticOutputParser` / `with_structured_output` |
-| 异步 | 手写 `httpx.AsyncClient` | `chain.ainvoke()` 自动异步 |
+| 维度 | Week 03 手写 | LangChain create_agent |
+|------|-------------|------------------------|
+| 创建 Agent | 手写 while True 循环 + 工具 dispatch | `create_agent(model, tools, system_prompt)` 一行 |
+| 工具绑定 | 手写 JSON Schema + if-elif dispatch | `@tool` 装饰器自动推断 |
+| 模型切换 | 改函数、改 headers、改 payload | 改一个 `model` 字符串 |
+| 持久化 | 无，或手动 json.dump | `checkpointer=InMemorySaver()` 自动存档 |
+| 多轮对话 | 手动维护 messages 列表 | `thread_id` 自动隔离会话 |
+| 流式输出 | 手写 SSE 行解析 | `agent.stream_events(version="v3")` |
+| 中间件 | 无（出问题加 print） | LangChain Callback 系统（日志/Tracing/Retry） |
 
-> **直觉类比：** Week 03 的 httpx 写法像「自己接线」——每接一个电器都要剥线、拧螺丝；LangChain 像统一了「插座标准」——电器（模型）和开关（调用方式）都按标准接口做，插上就能用。但你得先知道线怎么接（手写过），才不会把零火线接反。
+> **直觉类比：** Week 03 的手写 Agent 像自己手搓一个引擎——每一步都清楚，但换零件（模型）就得重新设计接口；`create_agent` 像买一台整车——接口统一（方向盘 + 油门），引擎坏了直接换而不改驾驶方式。但你先手搓过引擎（Week 03），才知道它替你封装了什么。
 
 ---
 
-## 二、模型抽象：init_chat_model 与统一接口
+## 二、模型抽象：init_chat_model 统一接口
 
 ### 2.1 ChatModel 是什么
 
@@ -60,9 +90,9 @@ LangChain 里所有对话模型的基类是 `BaseChatModel`，它定义了统一
 
 注意返回的是 `AIMessage` 对象而不是裸字符串——`content` 是文本，`tool_calls` 是工具调用，`usage_metadata` 是 token 用量。这比 Week 03 从 `choices[0].message.content` 抠字段干净得多。
 
-### 2.2 init_chat_model：一个函数对接所有家
+### 2.2 init_chat_model：一个函数对接所有模型
 
-`init_chat_model` 是 LangChain 提供的工厂函数，按 `model_provider` 自动实例化对应的 ChatModel 类。它最大的价值是**让模型成为配置而非代码**：
+`init_chat_model` 是 LangChain 提供的工厂函数，按模型标识串自动实例化对应的 ChatModel 类。它最大的价值是**让模型成为配置而非代码**：
 
 ```python
 """模型抽象演示：init_chat_model 一个函数对接多供应商"""
@@ -71,16 +101,15 @@ import os
 from langchain.chat_models import init_chat_model
 
 
-def get_model(provider: str = "openai", temperature: float = 0.7):
+def get_model(provider: str = "ollama", temperature: float = 0.7):
     """
     按供应商名返回一个 ChatModel 实例。
 
     切换模型只改 provider 字符串，调用代码一行不动。
     LangChain 本身不提供 LLM，只做集成抽象——
-    底下真正发请求的还是 openai / anthropic / ollama 的 SDK。
+    底下真正发请求的还是各家的 SDK。
     """
     if provider == "openai":
-        # OpenAI 官方 / 兼容服务（如 DeepSeek）都走 ChatOpenAI
         return init_chat_model(
             "gpt-4o-mini",
             model_provider="openai",
@@ -89,7 +118,7 @@ def get_model(provider: str = "openai", temperature: float = 0.7):
         )
 
     if provider == "deepseek":
-        # DeepSeek 是 OpenAI 兼容协议，用 ChatOpenAI 指定 base_url 即可
+        # DeepSeek 是 OpenAI 兼容协议，用 ChatOpenAI 指定 base_url
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             model="deepseek-chat",
@@ -100,7 +129,7 @@ def get_model(provider: str = "openai", temperature: float = 0.7):
 
     if provider == "anthropic":
         return init_chat_model(
-            "claude-3-5-sonnet-latest",
+            "claude-sonnet-4-6",
             model_provider="anthropic",
             temperature=temperature,
             api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -109,9 +138,18 @@ def get_model(provider: str = "openai", temperature: float = 0.7):
     if provider == "ollama":
         # 本地 Ollama，零配置、数据不出本机
         return init_chat_model(
-            "llama3.1",
+            "qwen2.5:1.5b",
             model_provider="ollama",
             temperature=temperature,
+        )
+
+    if provider == "google_genai":
+        # Gemini 系列：model 标识串格式 "google_genai:gemini-3.5-flash"
+        return init_chat_model(
+            "google_genai:gemini-3.5-flash",
+            model_provider="google_genai",
+            temperature=temperature,
+            api_key=os.getenv("GOOGLE_API_KEY"),
         )
 
     raise ValueError(f"不支持的 provider: {provider}")
@@ -119,16 +157,17 @@ def get_model(provider: str = "openai", temperature: float = 0.7):
 
 if __name__ == "__main__":
     # 切模型只改一个参数，调用方式完全一致
-    model = get_model("ollama")          # 本地随便跑，不花钱
-    # model = get_model("deepseek")      # 想用云端换一行即可
-    # model = get_model("anthropic")     # 换 Claude 也是一行
+    model = get_model("ollama")              # 本地随便跑，不花钱
+    # model = get_model("deepseek")          # 想用云端换一行即可
+    # model = get_model("anthropic")         # 换 Claude 也是一行
+    # model = get_model("google_genai")      # 换 Gemini 也是一行
 
     # 同一个 model，三种调用方式无缝切换
     print("=== invoke 同步 ===")
-    print(model.invoke("用一句话解释什么是 LCEL").content)
+    print(model.invoke("用一句话解释什么是 Agent").content)
 
     print("\n=== stream 流式 ===")
-    for chunk in model.stream("用一句话解释什么是 RAG"):
+    for chunk in model.stream("用一句话解释什么是 Tool Calling"):
         print(chunk.content, end="", flush=True)
     print()
 
@@ -138,406 +177,455 @@ if __name__ == "__main__":
         print(r.content)
 ```
 
-### 2.3 invoke / stream / batch 对比
+### 2.3 模型标识串格式
 
-同一个 ChatModel，三种调用方式背后是同一套 HTTP 调用逻辑，只是框架帮你包装了不同的迭代/并发策略：
+`init_chat_model` 的第一个参数是模型标识串，格式为 `"provider:model_name"`：
 
-| 调用方式 | 底层机制 | Week 03 对应手写量 | 适用场景 |
-|----------|----------|--------------------|----------|
-| `invoke` | 单次 POST，等完整响应 | `call_llm()` ~50 行 | 一次性问答、后台任务 |
-| `stream` | POST + `stream=True`，按 SSE 解析 | `call_llm_stream()` ~40 行手写行解析 | 用户可见的逐字输出 |
-| `batch` | 并发多个 POST（默认 max_concurrency=5） | 自己写 `asyncio.gather` + 重试 | 批量评测、数据集处理 |
+| 标识串示例 | 含义 | 对应集成包 |
+|-----------|------|-----------|
+| `"openai:gpt-4o-mini"` | OpenAI GPT-4o-mini | `langchain-openai` |
+| `"anthropic:claude-sonnet-4-6"` | Anthropic Claude Sonnet 4-6 | `langchain-anthropic` |
+| `"ollama:qwen2.5:1.5b"` | Ollama 本地模型 | `langchain-ollama` |
+| `"google_genai:gemini-3.5-flash"` | Google Gemini 3.5 Flash | `langchain-google-genai` |
+| `"deepseek-chat"` | DeepSeek（用 ChatOpenAI + base_url） | `langchain-openai` |
 
-> **关键认知：** Week 03 你为「流式」单独写了一个函数、为「批量」还得自己写并发。LangChain 里这三个是同一个 model 对象上的方法，写法一致、错误处理一致。这就是抽象的回报。
+> **提示：** 标识串也可以只传模型名（如 `"gpt-4o-mini"`），此时需额外指定 `model_provider` 参数。推荐用完整标识串，更明确。
 
 ---
 
-## 三、Prompt 模板：从 f-string 拼接升级到模板变量
+## 三、create_agent() 入门：一行创建完整 Agent
 
-### 3.1 Week 03 的拼法回顾
+### 3.1 什么是 create_agent
 
-Week 03 里多轮对话是这样拼的：
+2026 年 LangChain 推出了 `create_agent` 高层 API（`from langchain.agents import create_agent`），它把"模型 + 工具 + Prompt + Checkpointer + 结构化输出"全部封装成一行调用。`create_agent` 底层基于 LangGraph，所以自带持久化、人机交互、流式等能力——但你不需要手动搭 `StateGraph`。
 
-```python
-messages = [
-    {"role": "system", "content": f"你是{role}，请简洁回答。"},
-    {"role": "user", "content": "你好"},
-    {"role": "assistant", "content": "你好！有什么可以帮你？"},
-    {"role": "user", "content": user_input},
-]
-resp = call_llm(messages)
-```
+三个核心参数：
 
-问题：系统提示和对话历史混在一个裸 list 里，想复用模板得复制粘贴，历史消息一长就乱。
+| 参数 | 类型 | 说明 | 示例 |
+|------|------|------|------|
+| `model` | str 或 ChatModel 实例 | 模型标识串或已初始化的 ChatModel | `"ollama:qwen2.5:1.5b"` |
+| `tools` | list[Tool] | 工具列表，每个工具用 `@tool` 装饰器定义 | `[search, calculator]` |
+| `system_prompt` | str | 系统提示词，定义 Agent 的角色和行为 | `"你是一个徒步规划助手"` |
 
-### 3.2 ChatPromptTemplate：模板变量替代 f-string
-
-`ChatPromptTemplate` 把「消息结构」和「变量填充」分开：模板定义消息骨架，`invoke` 时传变量值。
+### 3.2 完整示例
 
 ```python
-"""Prompt 模板演示"""
-from langchain_core.prompts import ChatPromptTemplate
+"""create_agent 完整示例：一行创建 Agent，对比 Week 03 手写 50 行 Agent Loop"""
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain.chat_models import init_chat_model
 
 
-# 普通模板：用 {变量} 占位，invoke 时填充
-prompt = ChatPromptTemplate.from_template(
-    "你是资深 {role}，请用一句话向 {audience} 解释 {topic}。"
+# -------- 工具定义 --------
+
+@tool
+def search(query: str) -> str:
+    """
+    搜索互联网，返回与 query 相关的信息摘要。
+
+    当用户问到实时信息、最新新闻、或需要外部知识时使用此工具。
+    """
+    # 生产环境此处应调真实搜索 API
+    return f"关于「{query}」的搜索结果：找到 3 条相关条目。"
+
+
+@tool
+def calculator(expression: str) -> str:
+    """
+    计算数学表达式，支持四则运算和括号。
+
+    当用户问到数学计算时使用此工具。expression 是数学表达式字符串。
+    示例："(3.5 + 2) * 4"
+    """
+    try:
+        result = eval(expression)  # 注意：仅做演示，生产环境用安全 eval
+        return f"{expression} = {result}"
+    except Exception as e:
+        return f"计算错误：{e}"
+
+
+# -------- 创建 Agent --------
+
+agent = create_agent(
+    model="ollama:qwen2.5:1.5b",         # 模型标识串，支持所有 provider
+    tools=[search, calculator],           # 工具列表，@tool 装饰器自动推断
+    system_prompt=(
+        "你是一个智能助手，可以使用搜索和计算工具来帮助用户。"
+        "当需要实时信息时使用搜索，当需要计算时使用计算器。"
+    ),
 )
 
-# 渲染：传一个 dict，得到 ChatPromptValue（内部是格式化好的消息列表）
-rendered = prompt.invoke({"role": "Python 工程师", "audience": "产品经理", "topic": "装饰器"})
-print(rendered)
-# → messages=[HumanMessage(content="你是资深 Python 工程师，请用一句话向 产品经理 解释 装饰器。")]
+
+# -------- 调用 Agent --------
+
+if __name__ == "__main__":
+    # 单轮 invoke
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "3.5 * 4 + 2 等于多少？"}]},
+    )
+    print(result["messages"][-1].content)
+    # 输出：3.5 * 4 + 2 = 16.0
 ```
 
-模板渲染出的 `ChatPromptValue` 可以直接喂给 model：`model.invoke(rendered)`。比起 Week 03 的 f-string，好处是模板可复用、变量显式声明（少一个会报错而不是悄悄拼成空串）。
+### 3.3 对比 Week 03 手写 Agent Loop
 
-### 3.3 MessagesPlaceholder：多轮对话历史的模板化
-
-真正的多轮对话有「固定部分」（system + 当前 user 输入）和「可变部分」（历史消息列表）。`MessagesPlaceholder` 就是为可变的历史消息列表设计的占位符：
-
-```python
-"""带历史消息的 Prompt 模板"""
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-
-# 模板定义消息骨架，history 是可变长度的历史消息占位
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "你是一个徒步旅行顾问，回答要基于实际经验，简洁实用。"),
-    MessagesPlaceholder(variable_name="history"),  # 历史对话，长度可变
-    ("human", "{input}"),                          # 当前用户输入
-])
-
-# 历史消息以 BaseMessage 列表形式传入
-from langchain_core.messages import HumanMessage, AIMessage
-
-history = [
-    HumanMessage(content="下周想去黄山，两天行程怎么安排？"),
-    AIMessage(content="建议 Day1 爬前山，Day2 走后山看日出..."),
-]
-
-rendered = prompt.invoke({
-    "history": history,
-    "input": "那需要带什么装备？",  # 模型会基于上文「黄山两天」回答
-})
-# 渲染结果是 [system, ...history, human] 完整消息列表
-```
-
-| 对比项 | Week 03 手拼 messages list | ChatPromptTemplate + MessagesPlaceholder |
-|--------|---------------------------|------------------------------------------|
-| 模板复用 | 复制粘贴 | 定义一次，多处 invoke |
-| 变量校验 | 漏填变量静默变空串 | 漏填变量直接报错 |
-| 历史消息 | 手动 append 进 list | `history` 占位符自动展开 |
-| 与链结合 | 手动拼完再传 model | 模板本身就是链的一个 Runnable 节点 |
-
-> **关键认知：** `ChatPromptTemplate` 本身也是一个 `Runnable`——它能 `invoke`、能 `stream`、能 `|` 进管道。这就是 LCEL 能把 prompt 当一个组件串进链的前提（见下一节）。
+| 维度 | Week 03 手写（~50 行） | Week 06 create_agent（1 行） |
+|------|-----------------------|-----------------------------|
+| 创建 Agent | `while True` 循环 + `break` 条件判断 | `create_agent(model, tools, sys_prompt)` |
+| 工具定义 | 手写函数 + 手写 JSON Schema dict | `@tool` 装饰器一行 |
+| 工具调度 | `if name == "search": ... elif ...` 函数派发 | 自动绑定，`create_agent` 内部处理 |
+| 消息管理 | 手动 `messages.append()` 维护列表 | 自动管理 Graph State |
+| 错误重试 | 无，或手写 try/except | LangGraph 内置错误处理 |
+| 流式输出 | 手写 SSE 解析 + `[DONE]` 判断 | `agent.stream_events(version="v3")` |
+| 持久化 | 无，进程重启全丢 | `checkpointer=InMemorySaver()` 可选传入 |
 
 ---
 
-## 四、LCEL 表达式链：用管道符串联 prompt | model | parser
+## 四、Agent 调用方式：invoke + 多轮对话
 
-### 4.1 什么是 LCEL
+### 4.1 带 thread_id 的 config
 
-LCEL（LangChain Expression Language）是 LangChain 的链组装语法，核心就一个符号：管道符 `|`。它把多个 `Runnable` 组件像 Unix 管道一样串联起来，前一个的输出自动喂给后一个的输入：
-
-```python
-chain = prompt | model | output_parser
-```
-
-这一行等价于：把 `prompt.invoke(input)` 的结果传给 `model.invoke()`，再把结果传给 `output_parser.invoke()`。看起来像语法糖，但它带来三个实打实的能力：**自动流式、自动批量、自动异步**。
-
-### 4.2 LCEL 的本质：Runnable.pipe()
-
-`|` 在 Python 里是 `__or__` 运算符。LangChain 给所有 `Runnable` 实现了 `__or__`，让它返回一个新的组合 Runnable。所以下面两种写法完全等价：
+`create_agent` 返回的 agent 可以接收一个 `config` 参数，其中 `thread_id` 是关键——它决定了多轮对话的会话隔离。同一个 `thread_id` 的历史会被 Checkpointer 保存，下一个 invoke 会看到上文；不同 `thread_id` 完全隔离。
 
 ```python
-# 写法一：管道符（LCEL 语法糖，推荐）
-chain = prompt | model | StrOutputParser()
-
-# 写法二：显式 pipe（等价，本质就是这个）
-chain = prompt.pipe(model).pipe(StrOutputParser())
-```
-
-理解了 `.pipe()` 这个本质，你就知道链是怎么工作的：链本身也是一个 `Runnable`，它把子组件的 `invoke / stream / batch / ainvoke` 串起来调用。Claude Code 审查你的链时，它也是从这个角度理解底层的（见副线笔记）。
-
-### 4.3 完整链示例 + 逐组件拆解
-
-```python
-"""LCEL 完整链示例：把 Week 03 的手写流程换成链"""
+"""Agent 多轮对话演示：thread_id 决定会话隔离"""
+from langchain.agents import create_agent
+from langchain.tools import tool
 from langchain.chat_models import init_chat_model
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.output_parsers import StrOutputParser
+from langgraph.checkpoint.memory import InMemorySaver
 
 
-def build_chain(model):
-    """
-    构建一个 LCEL 链：prompt → model → parser。
+@tool
+def get_weather(city: str) -> str:
+    """查询指定城市的当前天气。city 为城市名称（中文）。"""
+    # 演示用 mock 数据
+    weather_data = {
+        "北京": "晴，25°C",
+        "上海": "多云，28°C",
+        "深圳": "雷阵雨，30°C",
+    }
+    return weather_data.get(city, f"{city}：暂无天气数据")
 
-    prompt 负责把变量渲染成消息；
-    model 负责调 LLM 生成回复；
-    StrOutputParser 负责从 AIMessage 里抠出纯文本。
-    """
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是徒步旅行顾问，回答简洁实用。"),
-        MessagesPlaceholder(variable_name="history"),
-        ("human", "{input}"),
-    ])
-    # 管道符把三个 Runnable 串成一条链
-    return prompt | model | StrOutputParser()
+
+# 创建带持久化的 Agent
+agent = create_agent(
+    model="ollama:qwen2.5:1.5b",
+    tools=[get_weather],
+    system_prompt="你是一个天气助手，用中文回答。",
+    checkpointer=InMemorySaver(),    # 启用会话持久化
+)
 
 
 if __name__ == "__main__":
-    model = init_chat_model("llama3.1", model_provider="ollama")
-    chain = build_chain(model)
+    from uuid import uuid7
 
-    history = [
-        HumanMessage(content="下周想去黄山两天。"),
-        AIMessage(content="建议 Day1 前山，Day2 后山看日出。"),
-    ]
+    # 第一轮对话：thread_id 为 session-1
+    thread_id = str(uuid7())
+    config = {"configurable": {"thread_id": thread_id}}
 
-    # 1. invoke —— 单次同步，等完整结果（Week 03 的 call_llm）
-    answer = chain.invoke({"history": history, "input": "带什么装备？"})
-    print(answer)
+    result1 = agent.invoke(
+        {"messages": [{"role": "user", "content": "北京今天天气如何？"}]},
+        config=config,
+    )
+    print("User: 北京今天天气如何？")
+    print("Agent:", result1["messages"][-1].content)
 
-    # 2. stream —— 流式逐块输出（Week 03 的 call_llm_stream，但不用手写 SSE 解析）
-    print("\n=== 流式 ===")
-    for chunk in chain.stream({"history": history, "input": "海拔多少？"}):
-        print(chunk, end="", flush=True)
-    print()
+    # 第二轮对话：同一个 thread_id，Agent 记得上文
+    result2 = agent.invoke(
+        {"messages": [{"role": "user", "content": "那上海呢？"}]},
+        config=config,
+    )
+    print("\nUser: 那上海呢？")
+    print("Agent:", result2["messages"][-1].content)
 
-    # 3. batch —— 批量并发（Week 03 要自己写 asyncio.gather）
-    answers = chain.batch([
-        {"history": [], "input": "黄山几月去最好？"},
-        {"history": [], "input": "泰山需要几天？"},
-    ])
-    for a in answers:
-        print(a)
+    # 第三轮：新 thread_id，Agent 不记得前两轮
+    new_config = {"configurable": {"thread_id": str(uuid7())}}
+    result3 = agent.invoke(
+        {"messages": [{"role": "user", "content": "那上海呢？"}]},
+        config=new_config,
+    )
+    print("\n--- 新会话 ---")
+    print("User: 那上海呢？")
+    print("Agent:", result3["messages"][-1].content)
+    # 注意：Agent 不记得前文，可能反问"哪个上海"或要求提供上下文
 ```
 
-### 4.4 逐组件拆解：数据如何流动
+### 4.2 thread_id 的作用
 
-链 `prompt | model | parser` 的数据流是这样的：
+| 场景 | thread_id 策略 | 效果 |
+|------|---------------|------|
+| 每个用户独立会话 | `uuid7()` 每次会话生成一个新 ID | 各用户互不干扰 |
+| 多轮连续对话 | 同一用户多次 invoke 用同一个 thread_id | Agent 记住上文 |
+| 测试/调试 | 固定 thread_id（如 `"debug-session"`） | 可复现对话历史 |
+| 重置对话 | 生成新 thread_id | 旧历史还在但不影响新对话 |
 
-| 步骤 | 组件 | 输入 | 输出 | 对应 Week 03 |
-|------|------|------|------|--------------|
-| 1 | `prompt` | `{"history": [...], "input": "..."}` | `ChatPromptValue`（消息列表） | 手拼 messages list |
-| 2 | `model` | `ChatPromptValue` | `AIMessage`（含 content + usage） | `call_llm()` 返回的 dict |
-| 3 | `StrOutputParser` | `AIMessage` | `str`（纯文本） | 从 `choices[0].message.content` 抠文本 |
+### 4.3 流式调用：stream_events
 
-### 4.5 LCEL 对比 Week 03 手写流程
+2026 年的新流式 API 是 `agent.stream_events`，它返回 typed projections，可以精确区分"文本块"和"工具调用块"：
 
-| 流程环节 | Week 03 手写 | LCEL 链 |
-|----------|--------------|---------|
-| 拼 prompt | 手动 list.append | `prompt.invoke({...})` |
-| 调模型 | `call_llm(messages)` | `model.invoke(prompt_value)` |
-| 解析输出 | `resp["choices"][0]["message"]["content"]` | `parser.invoke(aimessage)` |
-| 流式 | 单独写 `call_llm_stream` 手解 SSE | 链不变，`chain.stream()` 即可 |
-| 批量 | 自己写循环/并发 | 链不变，`chain.batch([...])` 即可 |
-| 异步 | 自己 `httpx.AsyncClient` | 链不变，`chain.ainvoke()` 即可 |
+```python
+# 流式输出（2026 年推荐 API）
+async for event in agent.stream_events(
+    {"messages": [{"role": "user", "content": "计算 (3+5)*2"}]},
+    config=config,
+    version="v3",
+):
+    if event.type == "text":
+        print(event.data, end="", flush=True)
+    elif event.type == "tool_call":
+        print(f"\n[调用工具: {event.name}({event.args})]")
+    elif event.type == "tool_result":
+        print(f"\n[工具返回: {event.data}]")
+```
 
-> **关键认知：** 同一条链，`invoke / stream / batch / ainvoke` 四种调用方式都能用，行为由链的编排逻辑保证——这是 LCEL 最大的回报。Week 03 你为每种调用方式各写一套代码；LCEL 写一条链，四种方式白送。
+> **注意：** 流式 API 需要模型和工具都支持流式。本地小模型（如 qwen2.5:1.5b）可能不支持完整流式，会退化成一次性输出。生产环境建议用 OpenAI / Anthropic 等云模型。
 
 ---
 
-## 五、输出解析器：把 LLM 的文本变成结构化对象
+## 五、LCEL 作为补充：什么时候用链，什么时候用 Agent
 
-### 5.1 Week 03 的结构化输出回顾
+### 5.1 两者的区别
 
-Week 03 的 `structured_output.py` 里，让 LLM 返回结构化数据要：把 Pydantic schema 手动转成 `tools`、手动 `tool_choice` 强制调用、再从 `tool_calls[0].function.arguments` 里 `json.loads` 取出 dict、最后 `Model(**dict)` 校验。一整套下来 30 多行，且 JSON Mode 和 Function Calling 是两套不同的解析逻辑。
+| 维度 | `create_agent` | LCEL 链 `prompt | model | parser` |
+|------|---------------|-----------------------------------------|
+| 适用场景 | 需要工具循环（搜索、计算、调 API） | 纯推理链（翻译、摘要、分类） |
+| 工具调用 | 内置工具循环，自动多轮 | 无工具循环，需手动 bind_tools |
+| 持久化 | 内置 Checkpointer | 无，需手动实现 |
+| 控制流 | 固定 ReAct 循环 | 通过自定义 Runnable 实现 |
+| 复杂度 | 高（含 Graph 状态管理） | 低（线性管道） |
+| 流式 | `stream_events(version="v3")` | `chain.stream()` 自动支持 |
 
-LangChain 的 Output Parser 把这套流程封装成链的最后一个组件。
+### 5.2 什么时候用 LCEL
 
-### 5.2 三种常用解析器
-
-| 解析器 | 作用 | 输出类型 | 适用场景 |
-|--------|------|----------|----------|
-| `StrOutputParser` | 从 AIMessage 抠纯文本 | `str` | 普通问答，只要文本 |
-| `JsonOutputParser` | 把文本解析成 JSON（部分模型支持流式解析） | `dict` | 要 JSON 但不想定义严格 schema |
-| `PydanticOutputParser` | 把文本解析成 Pydantic 对象 + 字段校验 | `BaseModel` 实例 | 严格结构化输出，复用 Week 03 的 Pydantic |
-
-### 5.3 PydanticOutputParser 完整示例
-
-`PydanticOutputParser` 会自动生成「格式说明」塞进 prompt，让 LLM 按要求输出 JSON，然后解析成 Pydantic 对象并校验。复用 Week 03 的 `ExtractedInfo` 模型：
+当你的任务**不需要工具**时，LCEL 更轻量：
 
 ```python
-"""PydanticOutputParser 演示：复用 Week 03 的 Pydantic 模型"""
-from pydantic import BaseModel, Field
-
+"""LCEL 链示例：纯推理场景，不需要工具"""
 from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers import StrOutputParser
 
+# 翻译链——不需要工具，单纯 prompt → model → parser
+prompt = ChatPromptTemplate.from_template(
+    "将以下英文翻译成中文：\n{text}"
+)
+model = init_chat_model("ollama:qwen2.5:1.5b")
+chain = prompt | model | StrOutputParser()
 
-class ExtractedInfo(BaseModel):
-    """从自然语言中提取的个人信息（沿用 Week 03 的定义）"""
-    姓名: str = Field(description="人物的中文全名")
-    年龄: int = Field(description="年龄（周岁）", ge=0, le=150)
-    城市: str = Field(description="所在城市")
-    技能: list[str] = Field(default_factory=list, description="掌握的技能列表")
-
-
-def build_extract_chain(model):
-    """
-    构建信息提取链：prompt(含格式说明) → model → PydanticOutputParser。
-
-    parser.get_format_instructions() 会生成一段「请按以下 JSON schema 输出」的说明，
-    .partial() 把它预先填进模板，这样每次 invoke 只传 {text} 即可。
-    """
-    parser = PydanticOutputParser(pydantic_object=ExtractedInfo)
-
-    prompt = ChatPromptTemplate.from_template(
-        "从下面的文本中提取个人信息。\n"
-        "{format_instructions}\n\n"
-        "文本: {text}"
-    ).partial(format_instructions=parser.get_format_instructions())
-
-    return prompt | model | parser
-
-
-if __name__ == "__main__":
-    model = init_chat_model("gpt-4o-mini", model_provider="openai")
-    chain = build_extract_chain(model)
-
-    # 直接拿到 Pydantic 对象，字段校验已由 parser 完成
-    info: ExtractedInfo = chain.invoke({
-        "text": "我叫张三，今年28岁，住北京，会Python和数据分析。"
-    })
-    print(info)                # 姓名='张三' 年龄=28 ...
-    print(info.技能)           # ['Python', '数据分析']
-    print(type(info))          # <class 'ExtractedInfo'>
+result = chain.invoke({"text": "LangChain is a framework for building LLM applications."})
+print(result)
+# 输出：LangChain 是一个用于构建 LLM 应用的框架。
 ```
 
-对比 Week 03：链里 `parser` 这一步，干的就是 Week 03 里「`json.loads(arguments)` + `ExtractedInfo(**dict)`」那两步，外加自动重试解析失败。你写的 Pydantic 模型一行没改，直接复用。
+### 5.3 什么时候用 create_agent
 
-### 5.4 更现代的写法：with_structured_output
-
-如果模型原生支持 Function Calling / tool calling（Day 02 会深入），还有更省事的写法——`with_structured_output` 让 model 直接吐 Pydantic 对象，连 parser 都不用写：
+当你的任务**需要工具循环**（模型可能需要多次调用工具才能得到最终答案）时，一定要用 `create_agent`：
 
 ```python
-# 模型原生支持工具调用时，一行搞定结构化输出
-structured_model = model.with_structured_output(ExtractedInfo)
-info: ExtractedInfo = structured_model.invoke("我叫李四，30岁，住上海，会Go")
+"""create_agent 示例：需要工具的场景"""
+from langchain.agents import create_agent
+from langchain.tools import tool
+
+@tool
+def search_stock(code: str) -> str:
+    """查询股票行情。code 为股票代码。"""
+    return f"{code} 当前价格：15.80 元，涨幅 +2.3%"
+
+# 需要搜索工具，Agent 可能先查股票再分析
+agent = create_agent(
+    model="ollama:qwen2.5:1.5b",
+    tools=[search_stock],
+    system_prompt="你是股票分析助手，查询行情后进行简单分析。",
+)
 ```
 
-这背后其实就是 Day 02 要讲的 `bind_tools` + 自动解析。今天先用 `PydanticOutputParser` 理解「输出解析」这个环节在链里的位置，明天再换更底层的工具调用写法。
+### 5.4 选择决策树
+
+```
+你的任务需要调工具（搜索/计算/API）吗？
+├── 是 → 用 create_agent（自动管理工具循环）
+│   ├── 需要多轮对话持久化？ → 加 checkpointer
+│   └── 不需要持久化？ → 不加也行
+└── 否 → 你的任务有复杂控制流吗？
+    ├── 是（条件分支、循环、并行）→ 手写 LangGraph StateGraph
+    └── 否（线性推理）→ LCEL 链 prompt|model|parser
+```
+
+> **核心原则：** `create_agent` 是"预包装的完整 Agent"；LCEL 是"搭积木的工具"。当你只需要搭一个简单积木（推理链）时用 LCEL；当你需要一个完整产品（Agent）时用 `create_agent`。两者不是替代关系，而是不同抽象层次的选择。
 
 ---
 
 ## 动手实验
 
-### 🟢 青铜级：跑通 LCEL 链
+### 🟢 青铜级：跑通 langchain_basics.py
 
-把今日产出 `langchain_basics.py` 跑起来，用本地 Ollama（不花钱）验证 `invoke / stream / batch` 三种调用方式都通。重点观察：流式输出是不是真的逐块 yield、batch 是不是真的并发。
+把今日产出 `langchain_basics.py` 跑起来，用本地 Ollama（不花钱）验证三个关键能力：
 
 ```bash
 # 先确保 Ollama 起着、拉了模型
 ollama serve
-ollama pull llama3.1
+ollama pull qwen2.5:1.5b
 
 # 跑今日产出
 python week06/langchain_basics.py
 ```
 
-### 🟡 白银级：模型切换对比
+依次验证：
+1. `init_chat_model` 成功初始化模型，`invoke / stream / batch` 都通
+2. `create_agent` 一行创建 Agent，跑通一次工具调用（比如 `calculator`）
+3. 多轮对话在同一 `thread_id` 下记住了上文
 
-用 `get_model()` 分别接 Ollama / DeepSeek / Anthropic（哪个有 key 用哪个），对同一个问题跑同一条链，对比三个模型的回答风格、耗时、token 用量。记录：换模型改了几行代码？（理想答案是：一行）
+### 🟡 白银级：多模型 + 多工具对比
 
-### 🔴 王者级：结构化提取对比
+1. 用 `get_model()` 分别接 Ollama / DeepSeek / OpenAI（哪个有 key 用哪个），对同一个问题跑同一条工具链，对比三个模型"是否自动决定调工具"的表现。注意：弱模型（本地小参数）经常不主动调工具，这是模型能力问题。
+2. 加至少一个自定义工具（比如 `get_time()` 返回当前时间），注册进 `create_agent`，验证 Agent 能在需要时自动调它。
 
-用 `PydanticOutputParser` 链和 `with_structured_output` 两种方式，对同一段文本做信息提取，对比：解析成功率、失败时的报错信息、能否流式产出。思考：为什么 `PydanticOutputParser` 能配合 `stream()`，而 `with_structured_output` 的流式行为依赖模型是否支持流式 tool calling？
+### 🔴 王者级：手写 stream_events 消费器
+
+1. 如果模型支持流式，实现一个完整的 `stream_events` 消费者，把文本块逐字输出、工具调用高亮显示、工具结果折叠展示，做成一个类似 ChatGPT 的终端聊天界面效果。
+2. 对比 `invoke` 和 `stream_events` 的耗时差异，记录：流式首 token 延迟（TTFT）和总完成时间。
+3. 思考：`stream_events` 返回的 typed projection 相比 Week 03 手写 SSE 解析，框架替你封装了哪些工作？
 
 ---
 
 ## 踩坑记录 🕳️
 
-### 坑 1：init_chat_model 找不到 provider
+### 坑 1：create_agent 的 model 参数传了字符串却报错
 
 ```
 ValueError: Unknown model provider: 'ollama'
 ```
 
-**解决：** `init_chat_model` 按需懒加载对应集成包。报这个错说明没装 `langchain-ollama` / `langchain-anthropic` 等。LangChain 把各家集成拆成了独立包，`pip install langchain` 不会带上所有 provider 包。用谁装谁：`pip install langchain-ollama`。
+**解决：** `create_agent` 的 `model` 参数支持字符串和已初始化的 ChatModel。传字符串时，它会内部调用 `init_chat_model` 去解析，这要求对应集成包已安装。报这个错说明没装 `langchain-ollama` / `langchain-anthropic` 等。用谁装谁：`pip install langchain-ollama`。也可以先自己 `init_chat_model` 得到实例再传进去，更可控。
 
-### 坑 2：流式没生效，一次性吐出全部
+### 坑 2：Agent 不调用工具，直接文本回答
 
-链 `prompt | model | StrOutputParser()` 调 `chain.stream()` 却一次返回完整字符串，不逐块。
+Agent 收到需要搜索或计算的问题时，直接输出文本而不调工具。
 
-**解决：** 检查 `model` 有没有用 `streaming=True` 或对应配置。部分模型集成默认不开流式，需要在实例化时显式开启（如老版 `ChatOpenAI(streaming=True)`）。新版 `init_chat_model` 一般默认支持，但 Ollama 本地偶尔因缓冲区问题需要确认 `ollama serve` 正常。另外确认你消费的是 `for chunk in chain.stream(...)` 而不是 `chain.stream(...)` 本身（它返回的是迭代器，要迭代才逐块产出）。
+**解决：** 这是最常见的 Agent 失败模式，通常有三个原因：
+- **模型太弱**：本地小模型（1.5B、3B 参数）经常不主动调工具，换 7B+ 或云端模型解决。
+- **system_prompt 不够明确**：在 system_prompt 里明确说"如果需要实时信息，请使用 search 工具""如果需要计算，请使用 calculator 工具"。
+- **工具描述太模糊**：`@tool` 的 docstring 要写清楚"什么时候用这个工具"和"参数含义"。比如 `search(query: str) -> str` 的 docstring 里写"当用户问到实时信息或最新新闻时使用此工具"，比只写"搜索互联网"有效得多。
 
-### 坑 3：PydanticOutputParser 解析失败：模型没按要求输出 JSON
+### 坑 3：多轮对话中 Agent 忘了上下文
 
-模型输出了一段解释文字 + JSON，或 JSON 外面裹了 ```json 代码块，解析器报 `OutputParserException`。
+```
+User: 北京天气如何？
+Agent: 北京晴 25°C
+User: 那上海呢？
+Agent: 请问您说的是哪个上海？
+```
 
-**解决：** 一是确保 `get_format_instructions()` 真的塞进了 prompt（用 `.partial()` 预填）；二是换能力更强的模型，弱模型（小参数本地模型）经常不遵守格式说明；三是用 `with_structured_output`（走 Function Calling，约束更强）；四是给 parser 配 `partial_json_handling` 容错（部分 parser 支持）。Week 03 你手写时也遇到过 JSON Mode 要在 system 里强调 'json'，本质一样。
+**解决：** 检查是否传了相同的 `thread_id`。新 `thread_id` 意味着全新会话，Agent 看不到之前的历史。确保：
+1. `create_agent` 时传了 `checkpointer=InMemorySaver()`
+2. 每次 invoke 都传了 `config={"configurable": {"thread_id": "同一个"}}`
+3. 如果需要 Agent 记住多轮，thread_id 在会话期间保持一致
 
-### 坑 4：模板变量漏填，链直接报错而非返回空
+### 坑 4：invoke 的输入格式不对
 
-Week 03 手拼 f-string 时漏填变量顶多拼成空串，链还能跑；LCEL 模板漏填直接 `KeyError`。
+```python
+# ❌ 错误：传了裸字符串
+agent.invoke("北京天气如何？")
 
-**解决：** 这其实是好事——早报错比悄悄拼错好。如果某些变量有默认值，用 `prompt.partial({"key": default})` 预填默认值；动态变量再在 `invoke` 时传。养成习惯：模板里出现的 `{变量}` 都要么 `.partial` 预填、要么 invoke 必传。
+# ❌ 错误：messages 格式不对
+agent.invoke({"input": "北京天气如何？"})
 
-### 坑 5：把 model 和 chain 的输入类型搞混
+# ✅ 正确：messages 列表格式
+agent.invoke({"messages": [{"role": "user", "content": "北京天气如何？"}]})
+```
 
-`model.invoke("字符串")` 可以，但 `chain.invoke("字符串")` 报错——因为链的第一个组件是 prompt，它要的是 `{"input": ..., "history": ...}` 这样的 dict，不是裸字符串。
+**解决：** `create_agent` 返回的 agent 期望输入是 dict 格式 `{"messages": [{"role": "...", "content": "..."}]}`。这个格式兼容 OpenAI 的消息格式，也是 LangGraph State 的默认输入结构。如果传错格式，Agent 会报错或静默失败。
 
-**解决：** 记住链的输入类型由**第一个组件**决定：第一个是 prompt 就传 dict，第一个是 model 才能传字符串/消息。理解了 `.pipe()` 本质（上一节）就不会搞混——链就是把输入交给第一个 Runnable。
+### 坑 5：stream_events 不输出任何内容
+
+```python
+# ❌ Agent 的 stream_events 返回空
+async for event in agent.stream_events(input, config, version="v3"):
+    print(event)
+```
+
+**解决：** 原因通常是模型不支持流式（本地小模型）或配置不对。检查：
+1. 模型是否支持流式输出（Ollama 的 qwen2.5:1.5b 流式支持有限）
+2. 是否用了 `version="v3"`（新 API 必需）
+3. 实在不行退回到 `invoke` 先确保功能性正常，流式做优化项
 
 ---
 
 ## 副线笔记
 
-### Claude Code 审查 LCEL 链：让它帮你拆解管道符底层
+### Claude Code 审查 Agent 代码：让 AI 帮你分析 Agent 配置
 
-今天的副线是把你的 LCEL 链代码交给 Claude Code 审查。不是让它夸你写得好，而是让它帮你**对照底层**——LCEL 的管道符看着像语法糖，但它到底替你做了什么？让 Claude Code 把链展开成等价的「手写流程」给你看。
+今天的副线是把你的 `create_agent` 定义交给 Claude Code 审查。不是让它夸你写得好，而是让它帮你**分析配置合理性**——你的 Agent 配置参数是否合适？还缺什么中间件？模型选择是否正确？
 
 ### 怎么让 Claude Code 审查
 
-把 `langchain_basics.py` 里那条 `prompt | model | StrOutputParser()` 链贴给 Claude Code，问它三个问题：
+把 `langchain_basics.py` 里 `create_agent` 的定义贴给 Claude Code，问它这几个问题：
 
-1. **「这个链有没有更简洁的写法？」** —— 它可能会指出：如果你的 prompt 只是单条用户消息，`ChatPromptTemplate.from_messages([("human","{input}")])` 可以换成更简短的 `from_template`；或者结构化输出用 `with_structured_output` 能省掉整个 parser。
-2. **「流式为什么没生效？」** —— 它会从 `Runnable` 的角度帮你排查：链的 `stream()` 是把上一个组件的 `stream()` 输出喂给下一个组件的 `stream()`，如果中间某个组件不支持流式（比如某些自定义 Runnable），整条链的流式就会退化成「先攒齐再吐」。
-3. **「`|` 这个管道符底层到底干了什么？」** —— 让它把 `prompt | model | parser` 翻译成 `.pipe()` 调用，再展开成等价的手写流程。
+1. **「这个 create_agent 配置合适吗？」** —— Claude Code 会从 `model` 选择、`tools` 的工具描述质量、`system_prompt` 的指令清晰度三个维度分析。比如它会指出：本地 1.5B 模型可能不会主动调工具，建议换 7B+ 或云端模型；或者工具 docstring 不够详细导致模型不知道什么时候用。
 
-### 管道符的本质：Runnable.pipe()
+2. **「工具定义还缺什么？」** —— Claude Code 会审查你的 `@tool` 函数的 docstring 是否规范。工具调用的成功率和 docstring 质量直接相关。它可能会建议：加参数校验、加错误处理、加使用示例。
 
-Claude Code 帮你看清的关键是：**LCEL 的 `|` 本质就是 `Runnable.__or__` 调用 `self.pipe(other)`**，返回一个新的 `RunnableSequence`。这个组合体也是个 `Runnable`，它的 `invoke` 是这样工作的：
+3. **「Middleware / Callback 还缺什么？」** —— Claude Code 会帮你检查：有没有加 Token 计数、有没有加日志 Tracing、有没有加重试机制。生产级的 Agent 还缺 LangSmith Tracing、LangFuse 监控等。
 
-```python
-# prompt | model | parser 等价于：
-class RunnableSequence:
-    def __init__(self, first, last):
-        self.first = first  # prompt
-        self.last = last    # model | parser（递归组合）
+4. **「stream_events 为什么没输出？」** —— 告诉 Claude Code 你的模型和配置，它会指出流式 API 的依赖链：模型必须支持流式 → `stream_events` 才有输出 → 没有输出通常是模型不支持流式。
 
-    def invoke(self, input):
-        # 把输入交给第一个组件，输出喂给剩下的链
-        return self.last.invoke(self.first.invoke(input))
+### 示例审查对话
 
-    def stream(self, input):
-        # 流式：第一个组件流式产出，逐块喂给后面的链
-        for chunk in self.first.stream(input):
-            yield from self.last.stream(chunk)
+```
+你：这个 create_agent 配置有什么问题？
+
+agent = create_agent(
+    model="ollama:qwen2.5:1.5b",
+    tools=[search, calculator],
+    system_prompt="你是一个助手",
+)
+
+Claude Code：我从三个角度分析：
+
+1. 模型选择：qwen2.5:1.5b 只有 1.5B 参数，工具调用能力很弱。
+   建议换 7B+（如 qwen2.5:7b 或云端模型）。
+
+2. 工具描述：search 的 docstring 只有"搜索互联网"，
+   缺少「什么时候用」。建议改为：
+   "搜索互联网获取实时信息。当用户问到最新新闻、
+   实时数据或你不知道的知识时使用此工具。"
+
+3. system_prompt：只写了"你是一个助手"，没有说明
+   工具的使用策略。建议加上：
+   "当需要实时信息时使用 search 工具，
+   当需要数学计算时使用 calculator 工具。"
+
+另外建议加 checkpointer 以支持多轮对话：
+   checkpointer=InMemorySaver(),
 ```
 
-看懂这个，你就明白为什么「同一条链自动支持流式/批量/异步」——因为 `RunnableSequence` 把这些调用方式都委托给子组件，只要子组件支持，链就支持。Week 03 你手写时，流式和批量是两套独立代码；LCEL 里它们是同一个 `RunnableSequence` 的三种方法，复用同一套编排逻辑。
+### 为什么这个审查有价值
+
+| 审查维度 | 自己检查容易漏 | Claude Code 能帮你 |
+|----------|---------------|-------------------|
+| 模型选择 | 只关心能不能跑，不关心参数大小 | 根据工具复杂度推荐合适的模型规模 |
+| 工具描述 | docstring 写了，但不够详细 | 从"模型怎么理解这个工具"的角度优化描述 |
+| system_prompt | 只写了角色没写工具策略 | 补充工具使用策略的指令 |
+| 缺少组件 | 不知道还缺什么 | 提醒加 checkpointer / Tracing / Callback |
+| 流式问题 | 各种试错 | 直接指出流式依赖链和瓶颈 |
 
 ### 今日观察任务
 
-- 把你的链贴给 Claude Code，让它写出等价的「不用 LCEL、纯手写」版本，对比行数和理解成本。
-- 问它「如果中间要插入一个自定义函数处理消息，怎么接进链」——答案是 `RunnableLambda` 或 `@chain` 装饰器，明天工具调用会用到。
-- 记下 Claude Code 指出的你链里能简化的地方，明天 Day 02 写工具调用链时直接用上。
+- 把你的 `create_agent` 定义和三个工具函数贴给 Claude Code，让它做一次完整的 Agent 配置审查。
+- 记下 Claude Code 指出的至少 2 个可优化点，在 Day 02 的 `@tool` 高级用法里用上。
+- 如果有时间，问 Claude Code "如果不建议用这个本地模型，你推荐哪个？"——它可能会对比 qwen2.5:7b、deepseek-chat、claude-sonnet-4-6 在工具调用上的表现差异。
 
 ---
 
 ## 今日产出检查清单
 
-- [ ] 用 `init_chat_model` 成功对接了至少一个 provider（Ollama / OpenAI / Anthropic）
+- [ ] 用 `init_chat_model` 成功初始化了至少一个 model provider（Ollama / OpenAI / Anthropic / Gemini）
 - [ ] 同一个 model 跑通了 `invoke / stream / batch` 三种调用方式
-- [ ] 用 `ChatPromptTemplate` + `MessagesPlaceholder` 拼了一个带历史的多轮对话模板
-- [ ] 用 LCEL 管道符 `prompt | model | parser` 组装了至少一条链，并理解它等价于 `.pipe()` 链式调用
-- [ ] 用 `PydanticOutputParser`（或 `with_structured_output`）跑通了一次结构化输出，复用了 Week 03 的 Pydantic 模型
-- [ ] 让 Claude Code 审查过你的 LCEL 链，并理解了管道符的 `Runnable.pipe()` 本质
+- [ ] 用 `create_agent(model, tools, system_prompt)` 一行创建了 Agent，并成功调用了至少一个工具
+- [ ] 理解了 `thread_id` 的会话隔离作用，跑通了多轮对话（同一 thread_id 记住上文，新 thread_id 全新开始）
+- [ ] 能区分 `create_agent`（需要工具循环）和 LCEL 链（纯推理）的适用场景
+- [ ] 让 Claude Code 审查过你的 `create_agent` 配置，并根据建议做了至少一处优化
 
 ---
 
-> **下一课预告：Day 02 — LangChain 工具调用：@tool / bind_tools**。今天我们把 Week 03 手写的「拼 messages → 调 API → 解析输出」换成了 LangChain 框架写法。明天继续把 Week 03 手写的 Function Calling 也换成框架写法：用 `@tool` 装饰器声明工具、用 `bind_tools` 绑定到 model、用 `ToolMessage` 回传执行结果，并对比手写版理解框架替你封装了什么。
+> **下一课预告：Day 02 — 工具调用深入：@tool / ToolRuntime / 状态注入**。今天我们用 `@tool` 装饰器定义了两个简单工具，并由 `create_agent` 自动管理工具循环。明天深入工具调用的底层机制：`@tool` 的参数校验与缓存、ToolRuntime 的执行上下文、工具状态注入、以及 `bind_tools` 的高级用法。同时讲清楚 `create_agent` 底部如何把 `@tool` 转成 LangGraph 的工具节点。
