@@ -17,15 +17,22 @@
 | 二 | Week 05 | 向量数据库 | 用 Claude Code 管理个人知识库（CLAUDE.md 进阶） | ⬜ |
 | 二 | Week 06 | LangChain + LangGraph | Claude Code 辅助调试 Agent 状态机 | ⬜ |
 | 三 | Week 07 | 多 Agent 协作 | 工具对比：Claude Code vs Cursor vs Aider | ⬜ |
-| 三 | Week 08 | MCP 协议 | 开发 MCP Server 并接入 Claude Code 验证 | ⬜ |
-| 三 | Week 09 | Agent 评估与优化 | 用 Claude Code 写评测脚本 + 回归测试 | ⬜ |
-| 四 | Week 10 | 养老护工项目实战 | Claude Code 全程结对编程驱动开发 | ⬜ |
-| 四 | Week 11 | 部署上线 | Claude Code 集成 CI/CD 自动化工作流 | ⬜ |
-| 四 | Week 12 | 综合实战 + 持续迭代 | Claude Code 工作流定型：你的专属开发范式 | ⬜ |
+| 三 | Week 08 | **MCP + Skills + 协议生态** | 开发 MCP Server + 写一个 SKILL.md 并接入 Claude Code | ⬜ |
+| 三 | Week 09 | **Agent 评测 + 可观测性 + 安全** | 用 Langfuse trace 调试 + 安全审计 | ⬜ |
+| 四 | Week 10 | 养老护工项目实战（含 Reflection + Agentic RAG） | Claude Code 全程结对编程 | ⬜ |
+| 四 | Week 11 | **部署 + 浏览器 Agent + 沙箱** | browser-use 实战 + E2B 沙箱 | ⬜ |
+| 四 | Week 12 | **面试准备 + 记忆管理深度 + 总复盘** | 模拟面试 + 12 周总复盘 | ⬜ |
 
 ⬜ 未开始　🟡 进行中　✅ 已完成
 
-> **📍 当前：Week 04（阶段二开局）** — 阶段一（Week 01-03）已收官：Python/FastAPI/LLM/Agent Loop 全部打通。
+> **📍 当前：Week 07（阶段三收官）** — 阶段一-二（Week 01-05）已收官，Week 06-07 LangChain/LangGraph/多Agent 协作已学完。
+>
+> **⚠️ 大纲更新说明（2026-07）：** Week 08-12 已根据 Agent-Learning-Hub 8 Stage 路线 + 2026 Agent 面试高频考点重新调整。主要变化：
+> - Week 08 从"MCP协议"扩展为"MCP + Skills + 协议生态"（补 Skills 概念、A2A/ACP）
+> - Week 09 从"评估与优化"扩展为"评测 + 可观测性 + 安全"（补 Langfuse trace、Prompt Injection 防御、沙箱）
+> - Week 10 新增 Reflection/Self-Correction 模式 + Agentic RAG 深度（冲突处理/权限隔离/Reranking）
+> - Week 11 新增浏览器 Agent（browser-use）+ 沙箱执行（E2B/Modal）
+> - Week 12 修正 CrewAI → LangGraph，新增记忆管理深度 + Workflow vs Autonomous 对比
 
 ### 副线设计思路
 
