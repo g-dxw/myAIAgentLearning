@@ -32,8 +32,9 @@ input_data = {
     "messages": [{"role": "user", "content": "北京今天天气怎么样？温度多少？"}]
 }
 
-stream = agent.stream_events(input_data, config, version="v3")
-
+stream = agent.stream(input_data, config, version="v3")
+for chunk in stream:
+   print(chunk, end="", flush=True)
 # # — 消费所有事件类型 —
 # for idx, snapshot in enumerate(stream):
 #     print(f"\n=== 帧 {idx + 1} ===")
@@ -54,8 +55,8 @@ stream = agent.stream_events(input_data, config, version="v3")
 #     if snapshot.interrupted:
 #         print(f"[interrupt]: {snapshot.interrupts}")
 
-# 最终输出
-final_output = stream.output
-if final_output:
-    last_msg = final_output["messages"][-1]
-    print(f"\n最终回答: {last_msg.content}")
+# # 最终输出
+# final_output = stream.output
+# if final_output:
+#     last_msg = final_output["messages"][-1]
+#     print(f"\n最终回答: {last_msg.content}")
